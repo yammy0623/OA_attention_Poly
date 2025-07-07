@@ -1,0 +1,10 @@
+demo/
+ecam/
+inference/
+original_data/
+wandb/
+**/__pycache__
+train/
+**.png
+**.npz
+LICENSE
