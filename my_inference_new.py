@@ -12,14 +12,16 @@ from tqdm.auto import tqdm
 from torch.utils.data import DataLoader
 from data_augmentation import CorrectBrightness, CorrectContrast, CorrectGamma
 from dataset import KneeMILDataset, mil_collate_fn
-from model import CompleteMILModel
+from model import CompleteMILModel, CompleteMILCamModel
 import matplotlib.pyplot as plt
+import argparse
 
 # ---------------- Configuration ---------------- #
 H5_FILE = rf"original_data\V00\knee_patches_patient_grouped_16_100_px.h5"
-CHECKPOINT_DIR = rf"original_data\V00\model_checkpoints"
-MEAN_STD_FILE_PATH = os.path.join(CHECKPOINT_DIR, "mean_std_train_patches.npy")
-PRETRAINED_MODEL_PATH = os.path.join(CHECKPOINT_DIR, "best_model_val_kappa.pth")
+CHECKPOINT_DIR = rf"original_data\V00\model_checkpoints_new"
+PRE_CHECKPOINT_DIR = rf"original_data\V00\model_checkpoints"
+MEAN_STD_FILE_PATH = os.path.join(CHECKPOINT_DIR, "mean_std_train_patches_original.npy")
+PRETRAINED_MODEL_PATH = os.path.join(PRE_CHECKPOINT_DIR, "best_model_val_kappa.pth")
 
 NUM_CLASSES = 5
 FEATURE_EXTRACTOR_OUT_DIM = 128
@@ -72,7 +74,8 @@ def plot_patches_grid_with_heatmaps(
     base_heatmap_alpha=0.3,
     attention_scores_norm=None, # Optional: for alpha modulation
     title_fontsize=8,
-    interpolation_method='nearest'
+    interpolation_method='nearest',
+    training_type="original"
 ):
     """
     Displays a grid of image patches with overlaid heatmaps.
@@ -147,10 +150,10 @@ def plot_patches_grid_with_heatmaps(
 
     plt.tight_layout(rect=[0, 0, 1, 0.95 if figure_title else 0.98]) # Adjust rect for suptitle
     # plt.show()
-    plt.savefig(r".\inference\heatmap.eps", format='eps')
-    plt.savefig(r".\inference\heatmap.png", format='png')
+    plt.savefig(rf".\inference\heatmap_{training_type}.eps", format='eps')
+    plt.savefig(rf".\inference\heatmap_{training_type}.png", format='png')
 
-def process_CAM(model, target_layer, target_class, patch_bag_tensor, patches_test):
+def process_CAM(model, target_layer, target_class, patch_bag_tensor, patches_test, training_type):
     from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
     from pytorch_grad_cam import GradCAM, ScoreCAM, GradCAMPlusPlus, AblationCAM, LayerCAM
     cam = GradCAM(
@@ -236,241 +239,12 @@ def process_CAM(model, target_layer, target_class, patch_bag_tensor, patches_tes
             patch_indices_map=PATCH_POINT_INDICES, # Replace with your actual indices
             figure_title=f"{method_name} Heatmaps on Patches",
             # attention_scores_norm=att_scores_norm, # Uncomment if using this
-            base_heatmap_alpha=0.3 # Explicitly setting the alpha from your original code
+            base_heatmap_alpha=0.3, # Explicitly setting the alpha from your original code
+            training_type=training_type
         )
-def enhance_patches_with_heatmaps(
-    patches_list,
-    heatmaps_list,
-    enhancement_strength=0.5
-):
-    """
-    Enhance image patches by applying their corresponding heatmaps
-    as feature boosts.
 
-    Args:
-        patches_list (list/np.array): List of image patches (each a NumPy array).
-        heatmaps_list (list/np.array): List of heatmaps corresponding to patches.
-        enhancement_strength (float): How much the heatmap boosts the patch.
 
-    Returns:
-        List of enhanced patch arrays.
-    """
-    if not patches_list:
-        print("No patches to process.")
-        return []
-
-    if len(patches_list) != len(heatmaps_list):
-        print("Error: Mismatch in lengths.")
-        return []
-
-    enhanced_patches_list = []
-    for idx in range(len(patches_list)):
-        patch = patches_list[idx].astype(np.float32)
-        heatmap = heatmaps_list[idx].astype(np.float32)
-
-        # Normalize heatmap to [0, 1]
-        heatmap_norm = (heatmap - heatmap.min()) / (heatmap.ptp() + 1e-8)
-
-        # Apply feature boost: element-wise multiplication or addition
-        enhanced_patch = patch + enhancement_strength * heatmap_norm * patch
-
-        # Clip to valid image range (assuming [0, 1])
-        enhanced_patch = np.clip(enhanced_patch, 0, 1)
-
-        enhanced_patches_list.append(enhanced_patch)
-
-    return enhanced_patches_list
-
-def run_epoch_CAM_1(method, loader, model, criterion, optimizer, device, is_training, desc=""):
-    model.train() if is_training else model.eval()
-    total_loss, all_preds, all_labels, num_samples = 0.0, [], [], 0
-    target_layer = [model.patch_feature_extractor.conv_block3[0]]
-    from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
-    from pytorch_grad_cam import GradCAM, ScoreCAM, GradCAMPlusPlus, AblationCAM, LayerCAM
-    cam = GradCAM(
-        model=model.patch_feature_extractor,     
-        target_layers=target_layer,
-        )
-    campp = GradCAMPlusPlus(
-        model=model.patch_feature_extractor,     
-        target_layers=target_layer,
-        )
-    scam = ScoreCAM(
-        model=model.patch_feature_extractor,     
-        target_layers=target_layer,
-        )
-    acam = AblationCAM(
-        model=model.patch_feature_extractor,    
-        target_layers=target_layer,
-        )
-    lcam = LayerCAM(
-        model=model.patch_feature_extractor,     
-        target_layers=target_layer,
-        )
-    
-
-    for bags, labels in tqdm(loader, desc=desc, leave=False):
-        if not bags:
-            continue
-
-        moved_bags = [] # [16, 41, 1, 16, 16]
-        valid_indices = []
-        enhanced_patches_list = []
-        for i, bag in enumerate(bags):
-            print("one bag shape:", bag.to(device).shape)
-            logits, att_scores = model(bag.to(device))
-            target_class = logits.argmax(dim=1).item()
-            batch_size = bag.shape[0]
-            targets = [ ClassifierOutputTarget(target_class) ] * batch_size
-            patch_bag_tensor = bag.to(device)
-            grayscale_cams = cam(
-                input_tensor=patch_bag_tensor,   # shape [41,1,16,16]
-                targets=targets
-            )
-            grayscale_camspp = campp(
-                input_tensor=patch_bag_tensor,   # shape [41,1,16,16]
-                targets=targets
-            )
-            grayscale_scam = scam(
-                input_tensor=patch_bag_tensor,   # shape [41,1,16,16]
-                targets=targets
-            )
-            grayscale_acam = acam(
-                input_tensor=patch_bag_tensor,   # shape [41,1,16,16]
-                targets=targets
-            )
-            grayscale_lcam = lcam(
-                input_tensor=patch_bag_tensor,   # shape [41,1,16,16]
-                targets=targets
-            )
-            cam_data_sources = {
-                "GradCAM": grayscale_cams,
-                "GradCAM++": grayscale_camspp,
-                "ScoreCAM": grayscale_scam,
-                "AblationCAM": grayscale_acam,
-                "LayerCAM": grayscale_lcam
-            }
-            grayscale_ensemble = None
-            for item in cam_data_sources:
-                if grayscale_ensemble is None:
-                    grayscale_ensemble = 1 / len(cam_data_sources) * cam_data_sources[item]
-                else:
-                    grayscale_ensemble = grayscale_ensemble + 1 / len(cam_data_sources) * cam_data_sources[item]
-
-            cam_data_sources["ensemble"] = grayscale_ensemble
-            for method_name, heatmaps in cam_data_sources.items():
-                if method_name == method:
-                    enhanced_patches = enhance_patches_with_heatmaps(
-                        patches_list=moved_bags,
-                        heatmaps_list=heatmaps,
-                        enhancement_strength=0.5
-                    )
-                else:
-                    continue
-            
-            if bag.nelement() > 0:
-                moved_bags.append(bag.to(device))
-                valid_indices.append(i)
-            with torch.set_grad_enabled(is_training):
-                outputs, _ = model(enhanced_patches_list)
-                if outputs.size(0) != labels.size(0):
-                    print(f"Skipping batch due to shape mismatch: {outputs.shape} vs {labels.shape}")
-                    continue
-
-                loss = criterion(outputs, labels)
-                if is_training:
-                    loss.backward()
-                    optimizer.step()
-
-            total_loss += loss.item() * labels.size(0)
-            _, predicted = torch.max(outputs.data, 1)
-            all_preds.extend(predicted.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-            num_samples += labels.size(0)
-        if not moved_bags:
-            continue
-
-        labels = labels[valid_indices].to(device)
-
-    avg_loss = total_loss / num_samples if num_samples else 0
-    return avg_loss, all_labels, all_preds
-
-def run_epoch_CAM(method, loader, model, criterion, optimizer, device, is_training, desc=""):
-    from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
-    from pytorch_grad_cam import GradCAM, GradCAMPlusPlus, ScoreCAM, AblationCAM, LayerCAM
-
-    model.train() if is_training else model.eval()
-
-    total_loss, all_preds, all_labels, num_samples = 0.0, [], [], 0
-
-    target_layer = [model.patch_feature_extractor.conv_block3[0]]
-    cam_methods = {
-        "GradCAM": GradCAM(model=model.patch_feature_extractor, target_layers=target_layer),
-        "GradCAM++": GradCAMPlusPlus(model=model.patch_feature_extractor, target_layers=target_layer),
-        "ScoreCAM": ScoreCAM(model=model.patch_feature_extractor, target_layers=target_layer),
-        "AblationCAM": AblationCAM(model=model.patch_feature_extractor, target_layers=target_layer),
-        "LayerCAM": LayerCAM(model=model.patch_feature_extractor, target_layers=target_layer)
-    }
-
-    cam = cam_methods[method]
-
-    for bags, labels in tqdm(loader, desc=desc, leave=False):
-        if not bags:
-            continue
-
-        for i, bag in enumerate(bags):
-            # bag: [N, C, H, W]
-            bag = bag.to(device)
-            print("Bag shape:", bag.shape)
-
-            # Run original forward to get predicted class
-            logits, _ = model(bag)
-            target_class = logits.argmax(dim=1).item()
-
-            targets = [ClassifierOutputTarget(target_class)] * bag.shape[0]
-
-            # Generate heatmaps
-            grayscale_cams = cam(input_tensor=bag, targets=targets)
-
-            # Enhance
-            bag_np = bag.detach().cpu().numpy()
-            enhanced_patches = enhance_patches_with_heatmaps(
-                patches_list=bag_np,
-                heatmaps_list=grayscale_cams,
-                enhancement_strength=0.5
-            )
-            # Convert back to tensor
-            enhanced_bag = torch.stack(
-                [torch.from_numpy(p) for p in enhanced_patches]
-            ).float().to(device)
-
-            # Forward pass on enhanced patches
-            with torch.set_grad_enabled(is_training):
-                outputs, _ = model(enhanced_bag)
-
-                if outputs.size(0) != labels.size(0):
-                    print(f"Skipping batch due to shape mismatch: {outputs.shape} vs {labels.shape}")
-                    continue
-
-                labels = labels.to(device)
-                loss = criterion(outputs, labels)
-
-                if is_training:
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-
-                total_loss += loss.item() * labels.size(0)
-
-                _, predicted = torch.max(outputs, 1)
-                all_preds.extend(predicted.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
-                num_samples += labels.size(0)
-
-    avg_loss = total_loss / num_samples if num_samples else 0
-    return avg_loss, all_labels, all_preds
-
-def run_epoch(loader, model, criterion, optimizer, device, is_training, desc=""):
+def run_epoch(loader, model, model_org, criterion, optimizer, device, is_training, training_type, desc=""):
     model.train() if is_training else model.eval()
     total_loss, all_preds, all_labels, num_samples = 0.0, [], [], 0
 
@@ -494,7 +268,7 @@ def run_epoch(loader, model, criterion, optimizer, device, is_training, desc="")
             optimizer.zero_grad()
 
         with torch.set_grad_enabled(is_training):
-            outputs, _ = model(moved_bags)
+            outputs, _ = model(moved_bags, model_org, training_type)
             if outputs.size(0) != labels.size(0):
                 print(f"Skipping batch due to shape mismatch: {outputs.shape} vs {labels.shape}")
                 continue
@@ -513,8 +287,15 @@ def run_epoch(loader, model, criterion, optimizer, device, is_training, desc="")
     avg_loss = total_loss / num_samples if num_samples else 0
     return avg_loss, all_labels, all_preds
 
+
 # ---------------- Main Execution ---------------- #
 if __name__ == '__main__':
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--training_type", type=str, default="original", choices=["original", "GradCAM", "GradCAMPlusPlus", "ScoreCAM", "AblationCAM", "LayerCAM"])
+    args = parser.parse_args()
+    training_type = args.training_type
+
     print(f"Using device: {DEVICE}")
 
     # 1. Load Patient IDs and filter valid samples
@@ -587,9 +368,11 @@ if __name__ == '__main__':
     test_loader = DataLoader(test_ds, BATCH_SIZE, False, collate_fn=mil_collate_fn, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
 
 
+
     # 6. Model, Loss, Optimizer
-    # MIL extractor
-    model = CompleteMILModel(FEATURE_EXTRACTOR_OUT_DIM, NUM_CLASSES, AGGREGATION_TYPE).to(DEVICE)
+    model = CompleteMILCamModel(FEATURE_EXTRACTOR_OUT_DIM, NUM_CLASSES, AGGREGATION_TYPE).to(DEVICE)
+    model_org = CompleteMILModel(FEATURE_EXTRACTOR_OUT_DIM, NUM_CLASSES, AGGREGATION_TYPE).to(DEVICE)
+    
     with h5py.File(H5_FILE, 'r') as hf:
         train_grades = [hf[group]['kl_grade'][0] for group in train_ds.sample_group_names]
     class_counts = np.bincount(train_grades, minlength=NUM_CLASSES)
@@ -603,38 +386,21 @@ if __name__ == '__main__':
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=10)
 
     # 7. Test Inference
-    WITHCAM = True
-    cam_data_sources = ["GradCAM", "GradCAM++", "ScoreCAM", "AblationCAM", "LayerCAM", "ensemble"]
-
-    if os.path.exists(PRETRAINED_MODEL_PATH):
-        if WITHCAM:
-            for method in cam_data_sources:
-                model.load_state_dict(torch.load(PRETRAINED_MODEL_PATH, map_location=DEVICE))
-                test_loss, test_labels, test_preds = run_epoch_CAM(method, test_loader, model, criterion, None, DEVICE, False, desc="Testing")
-                print("Method: ", method)
-                print(f"\nTest Loss: {test_loss:.4f}")
-                print(f"Accuracy: {accuracy_score(test_labels, test_preds):.4f}")
-                print(f"F1: {f1_score(test_labels, test_preds, average='weighted'):.4f}")
-                print(f"Kappa: {cohen_kappa_score(test_labels, test_preds, weights='quadratic'):.4f}")
-                print(classification_report(test_labels, test_preds, target_names=[f"KL {i}" for i in range(NUM_CLASSES)]))
-                ConfusionMatrixDisplay.from_predictions(test_labels, test_preds, normalize="true", cmap=plt.cm.Greens, values_format='.2f')
-                plt.savefig(f".\inference\cm_{method}.eps", format='eps')
-                plt.savefig(f".\inference\cm_{method}.png", format='png')
-        else:
-            model.load_state_dict(torch.load(PRETRAINED_MODEL_PATH, map_location=DEVICE))
-            test_loss, test_labels, test_preds = run_epoch(test_loader, model, criterion, None, DEVICE, False, desc="Testing")
-            print(f"\nTest Loss: {test_loss:.4f}")
-            print(f"Accuracy: {accuracy_score(test_labels, test_preds):.4f}")
-            print(f"F1: {f1_score(test_labels, test_preds, average='weighted'):.4f}")
-            print(f"Kappa: {cohen_kappa_score(test_labels, test_preds, weights='quadratic'):.4f}")
-            print(classification_report(test_labels, test_preds, target_names=[f"KL {i}" for i in range(NUM_CLASSES)]))
-            ConfusionMatrixDisplay.from_predictions(test_labels, test_preds, normalize="true", cmap=plt.cm.Greens, values_format='.2f')
-            plt.savefig(r".\inference\cm.eps", format='eps')
-            plt.savefig(r".\inference\cm.png", format='png')
+    if os.path.exists(CHECKPOINT_DIR):
+        model.load_state_dict(torch.load(os.path.join(CHECKPOINT_DIR, f"best_model_{training_type}_val_acc.pth"), map_location=DEVICE))
+        model_org.load_state_dict(torch.load(PRETRAINED_MODEL_PATH , map_location=DEVICE))
+        
+        test_loss, test_labels, test_preds = run_epoch(test_loader, model, model_org, criterion, None, DEVICE, False, training_type, desc="Testing")
+        print(f"\nTest Loss: {test_loss:.4f}")
+        print(f"Accuracy: {accuracy_score(test_labels, test_preds):.4f}")
+        print(f"F1: {f1_score(test_labels, test_preds, average='weighted'):.4f}")
+        print(f"Kappa: {cohen_kappa_score(test_labels, test_preds, weights='quadratic'):.4f}")
+        print(classification_report(test_labels, test_preds, target_names=[f"KL {i}" for i in range(NUM_CLASSES)]))
+        ConfusionMatrixDisplay.from_predictions(test_labels, test_preds, normalize="true", cmap=plt.cm.Greens, values_format='.2f')
+        plt.savefig(rf".\inference\cm_{training_type}.eps", format='eps')
+        plt.savefig(rf".\inference\cm_{training_type}.png", format='png')
     else:
         print(f"Pretrained model not found at: {PRETRAINED_MODEL_PATH}")
-    
-    
 
     # 8. grad-cam visualization (choose one figure)
     target_id = "9932578"
@@ -645,9 +411,24 @@ if __name__ == '__main__':
     patch_bag_tensor = torch.stack(patches_test).to(DEVICE)  # shape: [41, 1, 16, 16]
     print(test_pids[index], label)
     model.eval()
-    logits, att_scores = model([patch_bag_tensor])
-    target_class = logits.argmax(dim=1).item()
+    logits, att_scores = model([patch_bag_tensor], model_org, training_type)
+
+    print(f"patch_bag_tensor shape: {patch_bag_tensor.shape}")  # shape you pass IN
+    print(f"logits shape: {logits.shape}")                      # shape OUT
+    print(f"att_scores shape: {att_scores.shape}")              # if relevant
+
+    # Argmax across classes
+    target_classes = logits.argmax(dim=1)
+    print(f"target_classes shape: {target_classes.shape}")      # should be [batch_size]
+
+    # If you want just the first class for score:
+    target_class = target_classes[0].item()
+    print(f"target_class: {target_class}")
+
+    # Use the first logit row (batch item 0) and its predicted class
     score = logits[0, target_class]
+    print(f"score shape: {score.shape}")  # should be scalar, so shape = []
+
     model.zero_grad()
     score.backward(retain_graph=True)
-    # process_CAM(model, target_layer, target_class, patch_bag_tensor, patches_test)
+    process_CAM(model, target_layer, target_class, patch_bag_tensor, patches_test, training_type)

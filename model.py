@@ -159,47 +159,16 @@ class CompleteMILCamModel(nn.Module):
         self.aggregator2 = MILAggregator(input_embedding_dim=feature_extractor_out_dim,
                                         num_classes=num_classes,
                                         aggregation_type=aggregation_type)
-        self.target_layer = [self.patch_feature_extractor.conv_block3[0]]
-        self.cam = GradCAM(
-            model=self.patch_feature_extractor.to("cuda"),     
-            target_layers=self.target_layer,
-            )
-        self.campp = GradCAMPlusPlus(
-            model=self.patch_feature_extractor,     
-            target_layers=self.target_layer,
-            )
-        self.scam = ScoreCAM(
-            model=self.patch_feature_extractor,     
-            target_layers=self.target_layer,
-            )
-        self.acam = AblationCAM(
-            model=self.patch_feature_extractor,    
-            target_layers=self.target_layer,
-            )
-        self.lcam = LayerCAM(
-            model=self.patch_feature_extractor,     
-            target_layers=self.target_layer,
-            )
-    def forward(self, list_of_patch_bags, gradcam_type): # list_of_patch_bags: list of tensors, each (N_i, C, H, W)
+        
+    def forward(self, list_of_patch_bags, model_org, gradcam_type): # list_of_patch_bags: list of tensors, each (N_i, C, H, W)
         batch_logits = []
         batch_att_scores = []
         batch_logits2 = []
         batch_att_scores2 = []
+        attention_tool = None
+        target_layer = [model_org.patch_feature_extractor.conv_block3[0]]
+        
 
-        if gradcam_type == "GradCAM":
-            attention_tool = self.cam
-        elif gradcam_type == "GradCAMPlusPlus":
-            attention_tool = self.campp
-        elif gradcam_type == "ScoreCAM":
-            attention_tool = self.scam
-        elif gradcam_type == "AblationCAM":
-            attention_tool = self.acam
-        elif gradcam_type == "LayerCAM":
-            attention_tool = self.lcam
-        elif gradcam_type == "original":
-            attention_tool = None
-        else:
-            print("Warning: No model")
         
         for patch_bag_tensor in list_of_patch_bags: # Iterate through samples in the batch
             # patch_bag_tensor is (N_i, C, H, W) for the i-th sample in batch
@@ -227,25 +196,65 @@ class CompleteMILCamModel(nn.Module):
             # print("patch_embeddings_stacked shape", patch_embeddings_stacked.shape) #  torch.Size([41, 1, 16, 16])
 
             # Generate attention map
-            if not attention_tool == None:
+            if not gradcam_type == "original":
                 target_class = sample_logits.argmax(dim=1).item()
                 targets = [ ClassifierOutputTarget(target_class) ] * patch_bag_tensor.shape[0]
-                with attention_tool as cam:
-                    attentionmap = cam(
-                        input_tensor=patch_bag_tensor,   # shape [41,1,16,16]
-                        targets=targets
-                    )
+                
+                # Override the outer no_grad here!
+                with torch.set_grad_enabled(True):
+                    logits, att_scores = model_org([patch_bag_tensor])
+                    score = logits[0, target_class]
+                    model_org.zero_grad()
+                    score.backward(retain_graph=True)
+
+                    # initialize here to prevend the layer hook!
+                    if attention_tool == None:
+                        if gradcam_type == "GradCAM":
+                            attention_tool = GradCAM(
+                            model=model_org.patch_feature_extractor,     
+                            target_layers=target_layer,
+                            )
+                        elif gradcam_type == "GradCAMPlusPlus":
+                            attention_tool = GradCAMPlusPlus(
+                            model=model_org.patch_feature_extractor,   
+                            target_layers=target_layer,
+                            )
+                        elif gradcam_type == "ScoreCAM":
+                            attention_tool = ScoreCAM(
+                            model=model_org.patch_feature_extractor,   
+                            target_layers=target_layer,
+                            )
+                        elif gradcam_type == "AblationCAM":
+                            attention_tool = AblationCAM(
+                            mmodel=model_org.patch_feature_extractor,       
+                            target_layers=target_layer,
+                            )
+                        elif gradcam_type == "LayerCAM":
+                            attention_tool = LayerCAM(
+                            model=model_org.patch_feature_extractor,        
+                            target_layers=target_layer,
+                            )
+                        elif gradcam_type == "original":
+                            attention_tool = None
+                        else:
+                            print("Warning: No model")
+
+                    attentionmap = attention_tool(
+                            input_tensor=patch_bag_tensor,   # shape [41,1,16,16]
+                            targets=targets
+                        )
                 # print("attentionmap shape: ", attentionmap.shape) # (41, 16, 16)
                 attentionmap = torch.tensor(attentionmap, device=patch_bag_tensor.device)
                 attentionmap_expanded = attentionmap.unsqueeze(1)  # (41, 1, 16, 16)
                 # print("attentionmap_expanded shape: ", attentionmap_expanded.shape)
-
                 # Combine the heatmap with patch
                 patch_dot_attentionmap = torch.matmul(patch_bag_tensor, attentionmap_expanded)
                 patch_dot_attentionmap_stacked = self.patch_feature_extractor(patch_dot_attentionmap)
                 sample_logits2, att_scores2 = self.aggregator2(patch_dot_attentionmap_stacked) # (1, num_classes)
                 batch_logits2.append(sample_logits2)
                 batch_att_scores2.append(att_scores2)
+                del patch_embeddings_stacked, patch_dot_attentionmap_stacked
+                torch.cuda.empty_cache() 
 
         if not batch_logits: # If entire batch was problematic
             print("Warning: Entire batch resulted in no logits.")

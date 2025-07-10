@@ -20,8 +20,9 @@ import wandb
 # ---------------- Configuration ---------------- #
 H5_FILE = rf"original_data\V00\knee_patches_patient_grouped_16_100_px.h5"
 CHECKPOINT_DIR = rf"original_data\V00\model_checkpoints_new"
+PRE_CHECKPOINT_DIR = rf"original_data\V00\model_checkpoints"
 MEAN_STD_FILE_PATH = os.path.join(CHECKPOINT_DIR, "mean_std_train_patches.npy")
-PRETRAINED_MODEL_PATH = os.path.join(CHECKPOINT_DIR, "best_model_val_kappa.pth")
+PRETRAINED_MODEL_PATH = os.path.join(PRE_CHECKPOINT_DIR, "best_model_val_kappa.pth")
 
 NUM_CLASSES = 5
 FEATURE_EXTRACTOR_OUT_DIM = 128
@@ -65,8 +66,10 @@ def calculate_mean_std(h5_file, sample_groups, save_path):
     return mean, std
 
 
-def run_epoch(loader, model, criterion, optimizer, device, is_training, training_type, desc=""):
+def run_epoch(loader, model, model_org, criterion, optimizer, device, is_training, training_type, desc=""):
     model.train() if is_training else model.eval()
+    model_org.eval()
+
     total_loss, all_preds, all_labels, num_processed_samples = 0.0, [], [], 0
 
     progress_bar = tqdm(loader, desc=desc, leave=False)
@@ -98,7 +101,7 @@ def run_epoch(loader, model, criterion, optimizer, device, is_training, training
             optimizer.zero_grad()
 
         with torch.set_grad_enabled(is_training): # Context manager for gradients
-            outputs, _ = model(moved_list_of_patch_bags, training_type) # Model takes the list of bags
+            outputs, _ = model(moved_list_of_patch_bags, model_org, training_type) # Model takes the list of bags
 
             # Ensure outputs and labels match in size after potential filtering
             if outputs.shape[0] != labels_batch.shape[0]:
@@ -130,7 +133,7 @@ def run_epoch(loader, model, criterion, optimizer, device, is_training, training
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--training_type", type=str, default="original", choices=["original", "GradCAM"])
+    parser.add_argument("--training_type", type=str, default="original", choices=["original", "GradCAM", "GradCAMPlusPlus", "ScoreCAM", "AblationCAM", "LayerCAM"])
     args = parser.parse_args()
     training_type = args.training_type
 
@@ -223,16 +226,18 @@ if __name__ == '__main__':
 
     # 6. Model, Loss, Optimizer
     model = CompleteMILCamModel(FEATURE_EXTRACTOR_OUT_DIM, NUM_CLASSES, AGGREGATION_TYPE).to(DEVICE)
+    model_org = CompleteMILModel(FEATURE_EXTRACTOR_OUT_DIM, NUM_CLASSES, AGGREGATION_TYPE).to(DEVICE)
+    model_org.load_state_dict(torch.load(PRETRAINED_MODEL_PATH, map_location=DEVICE))
     
     # <<<<<<< LOAD PRE-TRAINED WEIGHTS >>>>>>>
-    if os.path.exists(PRETRAINED_MODEL_PATH):
-        try:
-            model.load_state_dict(torch.load(PRETRAINED_MODEL_PATH, map_location=DEVICE))
-            print(f"Successfully loaded pre-trained weights from: {PRETRAINED_MODEL_PATH}")
-        except Exception as e:
-            print(f"Error loading pre-trained weights: {e}. Training from scratch.")
-    else:
-        print(f"Pre-trained model path not found: {PRETRAINED_MODEL_PATH}. Training from scratch.")
+    # if os.path.exists(PRETRAINED_MODEL_PATH):
+    #     try:
+    #         model.load_state_dict(torch.load(PRETRAINED_MODEL_PATH, map_location=DEVICE))
+    #         print(f"Successfully loaded pre-trained weights from: {PRETRAINED_MODEL_PATH}")
+    #     except Exception as e:
+    #         print(f"Error loading pre-trained weights: {e}. Training from scratch.")
+    # else:
+    #     print(f"Pre-trained model path not found: {PRETRAINED_MODEL_PATH}. Training from scratch.")
 
     # weighted loss for class imbalance
     train_kl_grades = []
@@ -267,7 +272,7 @@ if __name__ == '__main__':
 
         # Training phase
         train_loss, train_labels, train_preds, processed_train_samples = run_epoch(
-            train_loader, model, criterion, optimizer, DEVICE, is_training=True, training_type=training_type,
+            train_loader, model, model_org, criterion, optimizer, DEVICE, is_training=True, training_type=training_type,
             desc=f"Epoch {epoch_num}/{NUM_EPOCHS} [Train]"
         )
         if processed_train_samples > 0:
@@ -288,7 +293,7 @@ if __name__ == '__main__':
 
         # Validation phase
         val_loss, val_labels, val_preds, processed_val_samples = run_epoch(
-            val_loader, model, criterion, None, DEVICE, is_training=False, training_type=training_type,# No optimizer needed for validation
+            val_loader, model, model_org, criterion, None, DEVICE, is_training=False, training_type=training_type,# No optimizer needed for validation
             desc=f"Epoch {epoch_num}/{NUM_EPOCHS} [Val]"
         )
 
@@ -298,7 +303,14 @@ if __name__ == '__main__':
             val_accuracy = accuracy_score(val_labels, val_preds)
             val_f1 = f1_score(val_labels, val_preds, average='weighted', zero_division=0)
             val_kappa = cohen_kappa_score(val_labels, val_preds, weights="quadratic") # Added Kappa
-
+            wandb.log({
+                "val/loss": val_loss,
+                "val/accuracy": val_accuracy,
+                "val/f1_weighted": val_f1,
+                "train/kappa": val_kappa,
+                "learning_rate": current_lr,
+                "epoch": epoch_num
+            })
             # writer.add_scalars('Loss', {'train': train_loss, 'val': val_loss}, epoch_num)
             # writer.add_scalars('Accuracy', {'train': train_accuracy, 'val': val_accuracy}, epoch_num)
             # writer.add_scalars('F1_score_weighted', {'train': train_f1, 'val': val_f1}, epoch_num)
