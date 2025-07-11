@@ -3,6 +3,7 @@ ecam/
 inference/
 original_data/
 wandb/
+model_checkpoints_tnc_final/
 **/__pycache__
 train/
 **.png

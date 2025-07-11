@@ -23,9 +23,9 @@ H5_FILE = rf"original_data\V00\knee_patches_patient_grouped_16_100_px.h5"
 # CHECKPOINT_DIR = rf"original_data\V00\model_checkpoints_0710_epoch200"
 # PRE_CHECKPOINT_DIR = rf"original_data\V00\model_checkpoints"
 CHECKPOINT_DIR = rf"original_data\V00\model_checkpoints_0710_epoch200_finalckpt"
-PRE_CHECKPOINT_DIR = rf"model_checkpoints_tnc_final"
+PRE_CHECKPOINT_DIR = rf"original_data\V00\model_checkpoints_0710_epoch200"
 MEAN_STD_FILE_PATH = os.path.join(CHECKPOINT_DIR, "mean_std_train_patches.npy")
-PRETRAINED_MODEL_PATH = os.path.join(PRE_CHECKPOINT_DIR, "best_model_val_acc.pth")
+PRETRAINED_MODEL_PATH = os.path.join(PRE_CHECKPOINT_DIR, "best_model_original_val_acc.pth")
 
 NUM_CLASSES = 5
 FEATURE_EXTRACTOR_OUT_DIM = 128

@@ -4,6 +4,8 @@ import torch.nn.functional as F
 import torchvision.models as models # For using pre-trained backbones
 import numpy as np
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+import copy
+
 
 class PatchFeatureExtractor(nn.Module):
     def __init__(self, output_embedding_dim=128, num_channels=32, dropout_rate=0.4, adaptive_pool_output_size=(2, 2)):
@@ -156,9 +158,7 @@ class CompleteMILCamModel(nn.Module):
         self.aggregator = MILAggregator(input_embedding_dim=feature_extractor_out_dim,
                                         num_classes=num_classes,
                                         aggregation_type=aggregation_type)
-        self.aggregator2 = MILAggregator(input_embedding_dim=feature_extractor_out_dim,
-                                        num_classes=num_classes,
-                                        aggregation_type=aggregation_type)
+       
         
     def forward(self, list_of_patch_bags, model_org, gradcam_type): # list_of_patch_bags: list of tensors, each (N_i, C, H, W)
         batch_logits = []
@@ -167,7 +167,9 @@ class CompleteMILCamModel(nn.Module):
         batch_att_scores2 = []
         attention_tool = None
         target_layer = [model_org.patch_feature_extractor.conv_block3[0]]
-        
+
+        if not gradcam_type == "original":
+            self.aggregator2 = copy.deepcopy(self.aggregator)
 
         
         for patch_bag_tensor in list_of_patch_bags: # Iterate through samples in the batch
@@ -243,7 +245,8 @@ class CompleteMILCamModel(nn.Module):
                             input_tensor=patch_bag_tensor,   # shape [41,1,16,16]
                             targets=targets
                         )
-                # print("attentionmap shape: ", attentionmap.shape) # (41, 16, 16)
+                    
+            # print("attentionmap shape: ", attentionmap.shape) # (41, 16, 16)
                 attentionmap = torch.tensor(attentionmap, device=patch_bag_tensor.device)
                 attentionmap_expanded = attentionmap.unsqueeze(1)  # (41, 1, 16, 16)
                 # print("attentionmap_expanded shape: ", attentionmap_expanded.shape)
