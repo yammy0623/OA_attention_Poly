@@ -17,13 +17,19 @@ import argparse
 import matplotlib.pyplot as plt
 import wandb
 import json
+from datetime import datetime
+import shutil
+
+# Get today’s date and time in YYYYMMDD_HHMM format
+now = datetime.now().strftime('%Y%m%d_%H%M')
 
 # ---------------- Configuration ---------------- #
-H5_FILE = rf"original_data\V00\knee_patches_patient_grouped_16_100_px.h5"
+H5_FILE = rf"model_checkpoints_tnc_final\knee_patches_patient_grouped_16_100.h5"
 # CHECKPOINT_DIR = rf"original_data\V00\model_checkpoints_0710_epoch200"
 # PRE_CHECKPOINT_DIR = rf"original_data\V00\model_checkpoints"
-CHECKPOINT_DIR = rf"original_data\V00\model_checkpoints_0710_epoch200_finalckpt"
 PRE_CHECKPOINT_DIR = rf"model_checkpoints_tnc_final"
+# Build your checkpoint directory string
+CHECKPOINT_DIR = rf"original_data\V00\model_checkpoints_{now}_epoch200_finalckpt_100"
 MEAN_STD_FILE_PATH = os.path.join(CHECKPOINT_DIR, "mean_std_train_patches.npy")
 PRETRAINED_MODEL_PATH = os.path.join(PRE_CHECKPOINT_DIR, "best_model_val_acc.pth")
 
@@ -142,19 +148,60 @@ if __name__ == '__main__':
 
     print(f"Training type: {training_type}")
     print(f"Using device: {DEVICE}")
+    print(f"Save Data to: {CHECKPOINT_DIR}")
+
+    # Build a short but meaningful name
+    timestamp = datetime.now().strftime('%m%d_%H%M')
+    run_name = f"{training_type}_lr{LEARNING_RATE:.0e}_b{BATCH_SIZE}_{timestamp}"  # e.g., "att_lr1e-4_b16_0717_1245"
 
     config = {
-            "training_type": training_type,
-            "batch_size": BATCH_SIZE,
-            "num_epochs": NUM_EPOCHS,
-            "learning_rate": LEARNING_RATE,
-            "weight_decay": wd,
-            "aggregation_type": AGGREGATION_TYPE,
-            "load_ckpt_path": PRETRAINED_MODEL_PATH
-        }
+        "h5_file": H5_FILE,
+        "mean_std_file_path": MEAN_STD_FILE_PATH,
+        "pretrained_model_path": PRETRAINED_MODEL_PATH,
+        "pre_ckpt_dir": PRE_CHECKPOINT_DIR,
+        "save_path": CHECKPOINT_DIR,
+        "num_classes": NUM_CLASSES,
+        "feature_extractor_out_dim": FEATURE_EXTRACTOR_OUT_DIM,
+        "aggregation_type": AGGREGATION_TYPE,
+        "learning_rate": LEARNING_RATE,
+        "weight_decay": WEIGHT_DECAY,
+        "batch_size": BATCH_SIZE,
+        "num_epochs": NUM_EPOCHS,
+        "seed": SEED,
+        "default_max_pixel_value": DEFAULT_MAX_PIXEL_VALUE,
+        "training_type": training_type,
+        "run_name": run_name,
+    }
+    print(config)
     
     # Make sure the directory exists
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
+    # List of files to copy
+    files_to_copy = ["my_train.py", "model.py", "my_inference.py", "dataset.py", "data_augmentation.py"]
+
+    # Copy each file to the checkpoint directory
+    for file in files_to_copy:
+        if os.path.exists(file):
+            shutil.copy(file, CHECKPOINT_DIR)
+            print(f"Copied {file} to {CHECKPOINT_DIR}")
+        else:
+            print(f"WARNING: {file} not found and was not copied.")
+
+
+    wandb.init(
+        project="Knee_OA_MIL",
+        name=run_name,
+        config=config,
+        tags=[
+            training_type,
+            AGGREGATION_TYPE,
+            f"lr{LEARNING_RATE:.0e}",
+            f"b{BATCH_SIZE}",
+            f"s{SEED}"
+        ],
+        # group=f"{training_type}_{AGGREGATION_TYPE}",
+    )
 
     # Write to JSON inside the checkpoint dir
     config_path = os.path.join(CHECKPOINT_DIR, "config.json")
@@ -163,12 +210,6 @@ if __name__ == '__main__':
 
     print(f"Config saved to: {config_path}")
 
-
-    wandb.init(
-        project="Knee_MIL",                # <-- name your wandb project
-        name=f"{training_type}_run",       # Run name
-        config=config
-    )
 
     # 1. Load Patient IDs and filter valid samples
     with h5py.File(H5_FILE, 'r') as hf:
@@ -242,7 +283,7 @@ if __name__ == '__main__':
 
 
     # 6. Model, Loss, Optimizer
-    model = CompleteMILCamModel(FEATURE_EXTRACTOR_OUT_DIM, NUM_CLASSES, AGGREGATION_TYPE).to(DEVICE)
+    model = CompleteMILCamModel(FEATURE_EXTRACTOR_OUT_DIM, NUM_CLASSES, training_type, AGGREGATION_TYPE).to(DEVICE)
     model_org = CompleteMILModel(FEATURE_EXTRACTOR_OUT_DIM, NUM_CLASSES, AGGREGATION_TYPE).to(DEVICE)
     model_org.load_state_dict(torch.load(PRETRAINED_MODEL_PATH, map_location=DEVICE))
     

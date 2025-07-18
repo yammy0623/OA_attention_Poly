@@ -12,14 +12,22 @@ from tqdm.auto import tqdm
 from torch.utils.data import DataLoader
 from data_augmentation import CorrectBrightness, CorrectContrast, CorrectGamma
 from dataset import KneeMILDataset, mil_collate_fn
-from model import CompleteMILModel
+from model import CompleteMILModel, CompleteMILCamModel
 import matplotlib.pyplot as plt
+import argparse
 
 # ---------------- Configuration ---------------- #
-H5_FILE = rf"original_data\V00\knee_patches_patient_grouped_16_100_px.h5"
-CHECKPOINT_DIR = rf"original_data\V00\model_checkpoints"
-MEAN_STD_FILE_PATH = os.path.join(CHECKPOINT_DIR, "mean_std_train_patches.npy")
-PRETRAINED_MODEL_PATH = os.path.join(CHECKPOINT_DIR, "best_model_val_kappa.pth")
+# H5_FILE = rf"original_data\V00\knee_patches_patient_grouped_16_128_px.h5"
+H5_FILE = rf"model_checkpoints_tnc_final\knee_patches_patient_grouped_16_100.h5"
+# H5_FILE = rf"original_data\V00\knee_patches_patient_grouped_16_100.h5"
+# CHECKPOINT_DIR = rf"model_checkpoints_tnc_final"
+CHECKPOINT_DIR = rf"original_data\V00\model_checkpoints_20250716_0615_epoch200_finalckpt_100"
+# PRE_CHECKPOINT_DIR = rf"model_checkpoints_tnc_final"
+# PRE_CHECKPOINT_DIR = rf"original_data\V00\model_checkpoints_0710_epoch200_finalckpt"
+PRE_CHECKPOINT_DIR = rf"original_data\V00\model_checkpoints_0710_epoch200_tien-en_ckpt_100"
+MEAN_STD_FILE_PATH = os.path.join(CHECKPOINT_DIR, "mean_std_train_patches_original.npy")
+PRETRAINED_MODEL_PATH = os.path.join(PRE_CHECKPOINT_DIR, "best_model_original_val_kappa.pth")
+IMG_SAVE_PATH=CHECKPOINT_DIR
 
 NUM_CLASSES = 5
 FEATURE_EXTRACTOR_OUT_DIM = 128
@@ -72,7 +80,8 @@ def plot_patches_grid_with_heatmaps(
     base_heatmap_alpha=0.3,
     attention_scores_norm=None, # Optional: for alpha modulation
     title_fontsize=8,
-    interpolation_method='nearest'
+    interpolation_method='nearest',
+    training_type="original"
 ):
     """
     Displays a grid of image patches with overlaid heatmaps.
@@ -147,10 +156,10 @@ def plot_patches_grid_with_heatmaps(
 
     plt.tight_layout(rect=[0, 0, 1, 0.95 if figure_title else 0.98]) # Adjust rect for suptitle
     # plt.show()
-    plt.savefig(r".\inference\heatmap.eps", format='eps')
-    plt.savefig(r".\inference\heatmap.png", format='png')
+    plt.savefig(rf"{IMG_SAVE_PATH}\heatmap_{training_type}.eps", format='eps')
+    plt.savefig(rf"{IMG_SAVE_PATH}\heatmap_{training_type}.png", format='png')
 
-def process_CAM(model, target_layer, target_class, patch_bag_tensor, patches_test):
+def process_CAM(model, target_layer, target_class, patch_bag_tensor, patches_test, training_type):
     from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
     from pytorch_grad_cam import GradCAM, ScoreCAM, GradCAMPlusPlus, AblationCAM, LayerCAM
     cam = GradCAM(
@@ -236,11 +245,12 @@ def process_CAM(model, target_layer, target_class, patch_bag_tensor, patches_tes
             patch_indices_map=PATCH_POINT_INDICES, # Replace with your actual indices
             figure_title=f"{method_name} Heatmaps on Patches",
             # attention_scores_norm=att_scores_norm, # Uncomment if using this
-            base_heatmap_alpha=0.3 # Explicitly setting the alpha from your original code
+            base_heatmap_alpha=0.3, # Explicitly setting the alpha from your original code
+            training_type=training_type
         )
 
 
-def run_epoch(loader, model, criterion, optimizer, device, is_training, desc=""):
+def run_epoch(loader, model, model_org, criterion, optimizer, device, is_training, training_type, desc=""):
     model.train() if is_training else model.eval()
     total_loss, all_preds, all_labels, num_samples = 0.0, [], [], 0
 
@@ -264,7 +274,7 @@ def run_epoch(loader, model, criterion, optimizer, device, is_training, desc="")
             optimizer.zero_grad()
 
         with torch.set_grad_enabled(is_training):
-            outputs, _ = model(moved_bags)
+            outputs, _ = model(moved_bags, model_org, training_type)
             if outputs.size(0) != labels.size(0):
                 print(f"Skipping batch due to shape mismatch: {outputs.shape} vs {labels.shape}")
                 continue
@@ -286,6 +296,12 @@ def run_epoch(loader, model, criterion, optimizer, device, is_training, desc="")
 
 # ---------------- Main Execution ---------------- #
 if __name__ == '__main__':
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--training_type", type=str, default="original", choices=["original", "GradCAM", "GradCAMPlusPlus", "ScoreCAM", "AblationCAM", "LayerCAM"])
+    args = parser.parse_args()
+    training_type = args.training_type
+
     print(f"Using device: {DEVICE}")
 
     # 1. Load Patient IDs and filter valid samples
@@ -360,7 +376,9 @@ if __name__ == '__main__':
 
 
     # 6. Model, Loss, Optimizer
-    model = CompleteMILModel(FEATURE_EXTRACTOR_OUT_DIM, NUM_CLASSES, AGGREGATION_TYPE).to(DEVICE)
+    model = CompleteMILCamModel(FEATURE_EXTRACTOR_OUT_DIM, NUM_CLASSES, AGGREGATION_TYPE).to(DEVICE)
+    model_org = CompleteMILModel(FEATURE_EXTRACTOR_OUT_DIM, NUM_CLASSES, AGGREGATION_TYPE).to(DEVICE)
+    
     with h5py.File(H5_FILE, 'r') as hf:
         train_grades = [hf[group]['kl_grade'][0] for group in train_ds.sample_group_names]
     class_counts = np.bincount(train_grades, minlength=NUM_CLASSES)
@@ -374,17 +392,19 @@ if __name__ == '__main__':
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=10)
 
     # 7. Test Inference
-    if os.path.exists(PRETRAINED_MODEL_PATH):
-        model.load_state_dict(torch.load(PRETRAINED_MODEL_PATH, map_location=DEVICE))
-        test_loss, test_labels, test_preds = run_epoch(test_loader, model, criterion, None, DEVICE, False, desc="Testing")
+    if os.path.exists(CHECKPOINT_DIR):
+        model.load_state_dict(torch.load(os.path.join(CHECKPOINT_DIR, f"best_model_{training_type}_val_acc.pth"), map_location=DEVICE))
+        model_org.load_state_dict(torch.load(PRETRAINED_MODEL_PATH , map_location=DEVICE))
+        
+        test_loss, test_labels, test_preds = run_epoch(test_loader, model, model_org, criterion, None, DEVICE, False, training_type, desc="Testing")
         print(f"\nTest Loss: {test_loss:.4f}")
         print(f"Accuracy: {accuracy_score(test_labels, test_preds):.4f}")
         print(f"F1: {f1_score(test_labels, test_preds, average='weighted'):.4f}")
         print(f"Kappa: {cohen_kappa_score(test_labels, test_preds, weights='quadratic'):.4f}")
         print(classification_report(test_labels, test_preds, target_names=[f"KL {i}" for i in range(NUM_CLASSES)]))
         ConfusionMatrixDisplay.from_predictions(test_labels, test_preds, normalize="true", cmap=plt.cm.Greens, values_format='.2f')
-        plt.savefig(r".\inference\cm.eps", format='eps')
-        plt.savefig(r".\inference\cm.png", format='png')
+        plt.savefig(rf"{IMG_SAVE_PATH}\cm_{training_type}.eps", format='eps')
+        plt.savefig(rf"{IMG_SAVE_PATH}\cm_{training_type}.png", format='png')
     else:
         print(f"Pretrained model not found at: {PRETRAINED_MODEL_PATH}")
 
@@ -397,7 +417,7 @@ if __name__ == '__main__':
     patch_bag_tensor = torch.stack(patches_test).to(DEVICE)  # shape: [41, 1, 16, 16]
     print(test_pids[index], label)
     model.eval()
-    logits, att_scores = model([patch_bag_tensor])
+    logits, att_scores = model([patch_bag_tensor], model_org, training_type)
 
     print(f"patch_bag_tensor shape: {patch_bag_tensor.shape}")  # shape you pass IN
     print(f"logits shape: {logits.shape}")                      # shape OUT
@@ -417,4 +437,4 @@ if __name__ == '__main__':
 
     model.zero_grad()
     score.backward(retain_graph=True)
-    process_CAM(model, target_layer, target_class, patch_bag_tensor, patches_test)
+    process_CAM(model, target_layer, target_class, patch_bag_tensor, patches_test, training_type)
