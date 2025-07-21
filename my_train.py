@@ -24,12 +24,9 @@ import shutil
 now = datetime.now().strftime('%Y%m%d_%H%M')
 
 # ---------------- Configuration ---------------- #
-H5_FILE = rf"model_checkpoints_tnc_final\knee_patches_patient_grouped_16_100.h5"
-# CHECKPOINT_DIR = rf"original_data\V00\model_checkpoints_0710_epoch200"
-# PRE_CHECKPOINT_DIR = rf"original_data\V00\model_checkpoints"
-PRE_CHECKPOINT_DIR = rf"model_checkpoints_tnc_final"
-# Build your checkpoint directory string
-CHECKPOINT_DIR = rf"original_data\V00\model_checkpoints_{now}_epoch200_finalckpt_100"
+H5_FILE = os.path.join("model_checkpoints_tnc_final", "knee_patches_patient_grouped_16_100.h5")
+PRE_CHECKPOINT_DIR = "model_checkpoints_tnc_final"
+CHECKPOINT_DIR = os.path.join("original_data", "V00", f"model_checkpoints_{now}_epoch200_finalckpt_100")
 MEAN_STD_FILE_PATH = os.path.join(CHECKPOINT_DIR, "mean_std_train_patches.npy")
 PRETRAINED_MODEL_PATH = os.path.join(PRE_CHECKPOINT_DIR, "best_model_val_acc.pth")
 
