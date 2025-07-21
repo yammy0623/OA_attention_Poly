@@ -17,16 +17,11 @@ import matplotlib.pyplot as plt
 import argparse
 
 # ---------------- Configuration ---------------- #
-# H5_FILE = rf"original_data\V00\knee_patches_patient_grouped_16_128_px.h5"
-H5_FILE = rf"model_checkpoints_tnc_final\knee_patches_patient_grouped_16_100.h5"
-# H5_FILE = rf"original_data\V00\knee_patches_patient_grouped_16_100.h5"
-# CHECKPOINT_DIR = rf"model_checkpoints_tnc_final"
-CHECKPOINT_DIR = rf"original_data\V00\model_checkpoints_20250716_0615_epoch200_finalckpt_100"
-# PRE_CHECKPOINT_DIR = rf"model_checkpoints_tnc_final"
-# PRE_CHECKPOINT_DIR = rf"original_data\V00\model_checkpoints_0710_epoch200_finalckpt"
-PRE_CHECKPOINT_DIR = rf"original_data\V00\model_checkpoints_0710_epoch200_tien-en_ckpt_100"
-MEAN_STD_FILE_PATH = os.path.join(CHECKPOINT_DIR, "mean_std_train_patches_original.npy")
-PRETRAINED_MODEL_PATH = os.path.join(PRE_CHECKPOINT_DIR, "best_model_original_val_kappa.pth")
+H5_FILE = os.path.join("model_checkpoints_tnc_final", "knee_patches_patient_grouped_16_100.h5")
+PRE_CHECKPOINT_DIR = "model_checkpoints_tnc_final"
+CHECKPOINT_DIR = os.path.join("original_data", "V00", f"model_checkpoints_20250718_1217_epoch200_finalckpt_100")
+MEAN_STD_FILE_PATH = os.path.join(CHECKPOINT_DIR, "mean_std_train_patches.npy")
+PRETRAINED_MODEL_PATH = os.path.join(PRE_CHECKPOINT_DIR, "best_model_val_acc.pth")
 IMG_SAVE_PATH=CHECKPOINT_DIR
 
 NUM_CLASSES = 5
@@ -156,8 +151,8 @@ def plot_patches_grid_with_heatmaps(
 
     plt.tight_layout(rect=[0, 0, 1, 0.95 if figure_title else 0.98]) # Adjust rect for suptitle
     # plt.show()
-    plt.savefig(rf"{IMG_SAVE_PATH}\heatmap_{training_type}.eps", format='eps')
-    plt.savefig(rf"{IMG_SAVE_PATH}\heatmap_{training_type}.png", format='png')
+    plt.savefig(os.path.join(IMG_SAVE_PATH, "heatmap_{training_type}.eps"), format='eps')
+    plt.savefig(os.path.join(IMG_SAVE_PATH, "heatmap_{training_type}.png"), format='png')
 
 def process_CAM(model, target_layer, target_class, patch_bag_tensor, patches_test, training_type):
     from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
@@ -403,8 +398,8 @@ if __name__ == '__main__':
         print(f"Kappa: {cohen_kappa_score(test_labels, test_preds, weights='quadratic'):.4f}")
         print(classification_report(test_labels, test_preds, target_names=[f"KL {i}" for i in range(NUM_CLASSES)]))
         ConfusionMatrixDisplay.from_predictions(test_labels, test_preds, normalize="true", cmap=plt.cm.Greens, values_format='.2f')
-        plt.savefig(rf"{IMG_SAVE_PATH}\cm_{training_type}.eps", format='eps')
-        plt.savefig(rf"{IMG_SAVE_PATH}\cm_{training_type}.png", format='png')
+        plt.savefig(os.path.join(IMG_SAVE_PATH, "cm_{training_type}.eps"), format='eps')
+        plt.savefig(os.path.join(IMG_SAVE_PATH, "cm_{training_type}.png"), format='png')
     else:
         print(f"Pretrained model not found at: {PRETRAINED_MODEL_PATH}")
 
