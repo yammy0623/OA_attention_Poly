@@ -12,7 +12,7 @@ from tqdm.auto import tqdm
 from torch.utils.data import DataLoader
 from data_augmentation import CorrectBrightness, CorrectContrast, CorrectGamma
 from dataset import KneeMILDataset, mil_collate_fn
-from model import CompleteMILModel, CompleteMILCamModel, CompleteMILCamModel_Attention_feedback
+from model import CompleteMILModel, CompleteMILCamModel, CompleteMILCamModel_Attention_feedback, CompleteMILOrdinalModel
 import argparse
 import matplotlib.pyplot as plt
 import wandb
@@ -25,7 +25,9 @@ from pytorch_grad_cam import GradCAM, ScoreCAM, GradCAMPlusPlus, AblationCAM, La
 # Get today’s date and time in YYYYMMDD_HHMM format
 # weight*(patch + attention patch)
 NOW = datetime.now().strftime('%Y%m%d_%H%M%S')
-WANDB=False
+
+DEBUG_MODE=False
+WANDB= not DEBUG_MODE
 DATA_HALF=False
 
 # ---------------- Configuration ---------------- #
@@ -50,6 +52,59 @@ DEFAULT_MAX_PIXEL_VALUE = 65535.0
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 NUM_WORKERS = 0
 PIN_MEMORY = DEVICE.type == 'cuda' and NUM_WORKERS > 0
+
+import torch.nn.functional as F
+
+class CoralLossWeighted(nn.Module):
+    """
+    CORAL loss with class weights to handle imbalanced data
+    """
+    def __init__(self, class_weights=None):
+        """
+        Args:
+            class_weights: Tensor of shape (num_classes,)
+                           對應到每個 class 的權重，例如 [w0, w1, w2, w3, w4]
+        """
+        super(CoralLossWeighted, self).__init__()
+        self.class_weights = class_weights
+
+    def forward(self, logits, targets):
+        """
+        Args:
+            logits: (batch_size, K-1)
+            targets: (batch_size,)
+        """
+        batch_size, num_classes_minus1 = logits.shape
+        prob = torch.sigmoid(logits)
+
+        # 建立 target matrix (binary)
+        target_matrix = torch.zeros((batch_size, num_classes_minus1), device=logits.device)
+        for i in range(batch_size):
+            target_matrix[i, :targets[i]] = 1
+
+        # 如果有 class weight
+        if self.class_weights is not None:
+            # 依照每個樣本的 true label 取對應權重
+            sample_weights = self.class_weights[targets]   # (batch_size,)
+            # 擴展到 (batch_size, K-1)，讓每個 cutpoint 都能乘上
+            sample_weights = sample_weights.unsqueeze(1).expand_as(prob)
+        else:
+            sample_weights = torch.ones_like(prob)
+
+        # Binary cross-entropy with weights
+        loss = F.binary_cross_entropy(prob, target_matrix, weight=sample_weights, reduction="mean")
+
+        return loss
+
+def coral_predict(logits):
+    """
+    logits: (batch_size, K-1)
+    return: predicted class (batch_size,)
+    """
+    prob = torch.sigmoid(logits)   # (batch, K-1)
+    # 檢查從左到右哪個 cutpoint 變成 <0.5
+    preds = torch.sum(prob > 0.5, dim=1)
+    return preds
 
 
 # ---------------- Utilities ---------------- #
@@ -81,42 +136,43 @@ def calculate_mean_std(h5_file, sample_groups, save_path):
 def run_epoch(loader, model, model_org, criterion, optimizer, device, is_training, training_type, feedback_type, desc=""):
     gradcam_type = training_type
     model.train() if is_training else model.eval()
-    model_org.eval()
-
     total_loss, all_preds, all_labels, num_processed_samples = 0.0, [], [], 0
-
     progress_bar = tqdm(loader, desc=desc, leave=False)
 
-    target_layer = [model_org.patch_feature_extractor.conv_block3[0]]
-    if gradcam_type == "GradCAM":
-        attention_tool = GradCAM(
-        model=model_org.patch_feature_extractor,     
-        target_layers=target_layer,
-        )
-    elif gradcam_type == "GradCAMPlusPlus":
-        attention_tool = GradCAMPlusPlus(
-        model=model_org.patch_feature_extractor,   
-        target_layers=target_layer,
-        )
-    elif gradcam_type == "ScoreCAM":  # should close the tqdm
-        attention_tool = ScoreCAM(
-        model=model_org.patch_feature_extractor,   
-        target_layers=target_layer,
-        )
-    elif gradcam_type == "AblationCAM": # should close the tqdm
-        attention_tool = AblationCAM(
-        model=model_org.patch_feature_extractor,       
-        target_layers=target_layer,
-        )
-    elif gradcam_type == "LayerCAM":
-        attention_tool = LayerCAM(
-        model=model_org.patch_feature_extractor,        
-        target_layers=target_layer,
-        )
-    elif gradcam_type == "original":
-        attention_tool = None
-    else:
-        print("Warning: No model")
+
+    if model_org:
+        model_org.eval()
+
+        target_layer = [model_org.patch_feature_extractor.conv_block3[0]]
+        if gradcam_type == "GradCAM":
+            attention_tool = GradCAM(
+            model=model_org.patch_feature_extractor,     
+            target_layers=target_layer,
+            )
+        elif gradcam_type == "GradCAMPlusPlus":
+            attention_tool = GradCAMPlusPlus(
+            model=model_org.patch_feature_extractor,   
+            target_layers=target_layer,
+            )
+        elif gradcam_type == "ScoreCAM":  # should close the tqdm
+            attention_tool = ScoreCAM(
+            model=model_org.patch_feature_extractor,   
+            target_layers=target_layer,
+            )
+        elif gradcam_type == "AblationCAM": # should close the tqdm
+            attention_tool = AblationCAM(
+            model=model_org.patch_feature_extractor,       
+            target_layers=target_layer,
+            )
+        elif gradcam_type == "LayerCAM":
+            attention_tool = LayerCAM(
+            model=model_org.patch_feature_extractor,        
+            target_layers=target_layer,
+            )
+        elif gradcam_type == "original":
+            attention_tool = None
+        else:
+            print("Warning: No model")
 
     for list_of_patch_bags, labels_batch, group_name, list_of_features in progress_bar:
         if list_of_patch_bags is None or not list_of_patch_bags:
@@ -134,7 +190,13 @@ def run_epoch(loader, model, model_org, criterion, optimizer, device, is_trainin
                 valid_indices_in_batch.append(i)
         
         for i in valid_indices_in_batch:
-                moved_list_of_features.append(list_of_features[i].to(DEVICE, non_blocking=PIN_MEMORY))
+                # print("feature: ", list_of_features[i][0][0])
+                # feat = list_of_features[i][0][0].unsqueeze(0)
+                # feat = list_of_features[i][0][:2]
+                feat = list_of_features[i][0]
+                # print(feat)
+                # feat = list_of_features[i]
+                moved_list_of_features.append(feat.to(DEVICE, non_blocking=PIN_MEMORY))
 
         
         # moved_list_of_patch_bags = torch.stack(moved_list_of_patch_bags).to(DEVICE)
@@ -152,8 +214,11 @@ def run_epoch(loader, model, model_org, criterion, optimizer, device, is_trainin
 
         with torch.set_grad_enabled(is_training): # Context manager for gradients
 
-            if feedback_type == 7:
+            if feedback_type == 7 or feedback_type == 8 or feedback_type == 9 or feedback_type == 10:
                 outputs = model(moved_list_of_patch_bags, model_org, attention_tool, moved_list_of_features) # Model takes the list of bags
+            elif feedback_type == 11:
+                outputs, _, _, _ = model(moved_list_of_patch_bags) # Model takes the list of bags
+
             else:
                 outputs, _, _, _, _, _ = model(moved_list_of_patch_bags, model_org, attention_tool) # Model takes the list of bags
 
@@ -163,6 +228,20 @@ def run_epoch(loader, model, model_org, criterion, optimizer, device, is_trainin
                 print(f"  Original num bags in list: {len(list_of_patch_bags)}, Moved: {len(moved_list_of_patch_bags)}")
                 continue
 
+            # print("labels_batch:", labels_batch)
+            # for k in moved_list_of_features:
+            #     print("moved_list_of_features:", k)  # Debugging line to check the features being passed
+            
+            if feedback_type == 10:
+                for i, labels in enumerate(labels_batch):
+                    if moved_list_of_features[i][0] == 0 and moved_list_of_features[i][1] == 0 and moved_list_of_features[i][2] == -999:
+                        # print("labels_batch org:", labels_batch[i])
+                        labels_batch[i] = 0  # Set label to 0 if features are zero
+            
+            # print("labels_batch:", labels_batch)
+            # for k in moved_list_of_features:
+            #     print("moved_list_of_features:", k)  # Debugging line to check the features being passed
+            
             loss = criterion(outputs, labels_batch)
 
             if is_training:
@@ -172,7 +251,10 @@ def run_epoch(loader, model, model_org, criterion, optimizer, device, is_trainin
         total_loss += loss.item() * labels_batch.size(0) # loss.item() is avg loss for batch
         num_processed_samples += labels_batch.size(0)
 
-        _, predicted = torch.max(outputs.data, 1)
+        if feedback_type == 11:
+            predicted = coral_predict(outputs) # logits
+        else:
+            _, predicted = torch.max(outputs.data, 1)
         all_preds.extend(predicted.cpu().numpy())
         all_labels.extend(labels_batch.cpu().numpy())
 
@@ -189,13 +271,18 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--training_type", type=str, default="original", choices=["original", "GradCAM", "GradCAMPlusPlus", "ScoreCAM", "AblationCAM", "LayerCAM"])
     parser.add_argument("--pre_ckpt", type=str, default="PRE_CHECKPOINT_DIR")
-    parser.add_argument("--feedback_type", type=int, default=1, choices=[1, 2, 3, 4, 5, 6, 7], help="1: (w*cam*p + p), 2: (w(cam*p + p)), 3: (w*cam*p), 4: (w*cam*p + p), 5: (w*cam*p + w*p)")
+    parser.add_argument("--feedback_type", type=int, default=1, choices=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], help="1: (w*cam*p + p), 2: (w(cam*p + p)), 3: (w*cam*p), 4: (w*cam*p + p), 5: (w*cam*p + w*p)")
+    parser.add_argument("--note", type=str, default="", help="Additional note for the run name")
+
+    num_features = 6
+    
     data_part = "halfdata" if DATA_HALF else "wholedata"
     args = parser.parse_args()
     training_type = args.training_type
     PRE_CHECKPOINT_DIR = args.pre_ckpt
     feedback_type = args.feedback_type
-    CHECKPOINT_DIR = os.path.join("original_data", "V00", f"model_checkpoints_{NOW}_epoch200_finalckpt_100_feedback_{feedback_type}")
+    note = args.note
+    CHECKPOINT_DIR = os.path.join("original_data", "V00", f"model_checkpoints_{NOW}_epoch200_finalckpt_100_feedback_{feedback_type}_{note}_feat_{num_features}")  # e.g., "att_lr1e-4_b16_0717_1245_feedback_1_onlyjsm_l"
     MEAN_STD_FILE_PATH = os.path.join(CHECKPOINT_DIR, "mean_std_train_patches.npy")
 
     print(f"Training type: {training_type}")
@@ -204,7 +291,7 @@ if __name__ == '__main__':
 
     # Build a short but meaningful name
     timestamp = datetime.now().strftime('%m%d_%H%M')
-    run_name = f"{training_type}_lr{LEARNING_RATE:.0e}_b{BATCH_SIZE}_{timestamp}_feedback_{feedback_type}_{data_part}"  # e.g., "att_lr1e-4_b16_0717_1245"
+    run_name = f"{training_type}_lr{LEARNING_RATE:.0e}_b{BATCH_SIZE}_{timestamp}_feedback_{feedback_type}_{data_part}_{note}_feat_{num_features}"  # e.g., "att_lr1e-4_b16_0717_1245"
 
     config = {
         "h5_file": H5_FILE,
@@ -230,15 +317,16 @@ if __name__ == '__main__':
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
     # List of files to copy
-    files_to_copy = ["my_train_feedback_all.py", "model.py", "my_inference_feedback_all.py", "dataset.py", "data_augmentation.py"]
+    files_to_copy = ["my_train_feedback_all.py", "model.py", "dataset.py", "data_augmentation.py"]
 
     # Copy each file to the checkpoint directory
-    # for file in files_to_copy:
-    #     if os.path.exists(file):
-    #         shutil.copy(file, CHECKPOINT_DIR)
-    #         print(f"Copied {file} to {CHECKPOINT_DIR}")
-    #     else:
-    #         print(f"WARNING: {file} not found and was not copied.")
+    if not DEBUG_MODE:
+        for file in files_to_copy:
+            if os.path.exists(file):
+                shutil.copy(file, CHECKPOINT_DIR)
+                print(f"Copied {file} to {CHECKPOINT_DIR}")
+            else:
+                print(f"WARNING: {file} not found and was not copied.")
 
 
     if WANDB:
@@ -350,9 +438,13 @@ if __name__ == '__main__':
 
 
     # 6. Model, Loss, Optimizer
-    model = CompleteMILCamModel_Attention_feedback(FEATURE_EXTRACTOR_OUT_DIM, NUM_CLASSES, training_type, feedback_type, AGGREGATION_TYPE).to(DEVICE)
-    model_org = CompleteMILModel(FEATURE_EXTRACTOR_OUT_DIM, NUM_CLASSES, AGGREGATION_TYPE).to(DEVICE)
-    model_org.load_state_dict(torch.load(PRETRAINED_MODEL_PATH, map_location=DEVICE))
+    if feedback_type == 11: # ordinal model
+        model = CompleteMILOrdinalModel(FEATURE_EXTRACTOR_OUT_DIM, NUM_CLASSES, AGGREGATION_TYPE).to(DEVICE)
+        model_org = None
+    else:
+        model = CompleteMILCamModel_Attention_feedback(FEATURE_EXTRACTOR_OUT_DIM, NUM_CLASSES, training_type, feedback_type, AGGREGATION_TYPE, num_features=num_features).to(DEVICE)
+        model_org = CompleteMILModel(FEATURE_EXTRACTOR_OUT_DIM, NUM_CLASSES, AGGREGATION_TYPE).to(DEVICE)
+        model_org.load_state_dict(torch.load(PRETRAINED_MODEL_PATH, map_location=DEVICE))
     
     # <<<<<<< LOAD PRE-TRAINED WEIGHTS >>>>>>>
     # if os.path.exists(PRETRAINED_MODEL_PATH):
@@ -376,7 +468,11 @@ if __name__ == '__main__':
     class_weights_normalized = class_weights_raw / np.sum(class_weights_raw) * NUM_CLASSES # Optional normalization
     class_weights_tensor = torch.tensor(class_weights_normalized, dtype=torch.float).to(DEVICE)
     print(f"Using class weights: {class_weights_tensor}")
-    criterion = nn.CrossEntropyLoss(weight=class_weights_tensor)
+
+    if feedback_type == 11:
+        criterion = CoralLossWeighted(class_weights=class_weights_tensor)
+    else:
+        criterion = nn.CrossEntropyLoss(weight=class_weights_tensor)
 
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=wd)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=10, factor=0.5) # For val_loss
