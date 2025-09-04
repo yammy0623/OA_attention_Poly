@@ -12,7 +12,7 @@ from tqdm.auto import tqdm
 from torch.utils.data import DataLoader
 from data_augmentation import CorrectBrightness, CorrectContrast, CorrectGamma
 from dataset import KneeMILDataset, mil_collate_fn
-from model import CompleteMILModel, CompleteMILCamModel, CompleteMILCamModel_Attention_feedback, CompleteMILOrdinalModel
+from model import CompleteMILModel, CompleteMILCamModel, CompleteMILCamModel_Attention_feedback, CompleteMILOrdinalModel, CompleteMILOrdinal_MultiTask_Model
 import argparse
 import matplotlib.pyplot as plt
 import wandb
@@ -96,6 +96,197 @@ class CoralLossWeighted(nn.Module):
 
         return loss
 
+
+class CoralLossEffective(nn.Module):
+    """
+    CORAL loss with per-threshold effective number weighting
+    """
+    def __init__(self, threshold_weights=None):
+        """
+        Args:
+            threshold_weights: Tensor of shape (K-1, 2),
+                               每個 threshold 的 [w_neg, w_pos]
+        """
+        super(CoralLossEffective, self).__init__()
+        self.threshold_weights = threshold_weights  # (K-1, 2)
+
+    def forward(self, logits, targets):
+        """
+        Args:
+            logits: (batch_size, K-1)
+            targets: (batch_size,)
+        """
+        batch_size, num_classes_minus1 = logits.shape
+        prob = torch.sigmoid(logits)
+
+        # target_matrix: (batch_size, K-1)
+        target_matrix = torch.zeros((batch_size, num_classes_minus1), device=logits.device)
+        for i in range(batch_size):
+            target_matrix[i, :targets[i]] = 1
+
+        # per-threshold BCE with weights
+        loss_matrix = torch.zeros_like(prob)
+        for k in range(num_classes_minus1):
+            w_neg, w_pos = self.threshold_weights[k]
+
+            # BCE 分開寫正負
+            loss_matrix[:, k] = - (
+                w_pos * target_matrix[:, k] * torch.log(prob[:, k] + 1e-8) +
+                w_neg * (1 - target_matrix[:, k]) * torch.log(1 - prob[:, k] + 1e-8)
+            )
+
+        return loss_matrix.mean()
+    
+class CoralFocalLoss(nn.Module):
+    """
+    Focal-CORAL loss with optional class weights for imbalanced data.
+    """
+    def __init__(self, class_weights=None, gamma=2.0, alpha=0.25):
+        """
+        Args:
+            class_weights: Tensor of shape (num_classes,), optional class-level weight
+            gamma: focusing parameter, typical value 2.0
+            alpha: balance parameter between positive/negative samples
+        """
+        super(CoralFocalLoss, self).__init__()
+        self.class_weights = class_weights
+        self.gamma = gamma
+        self.alpha = alpha
+
+    def forward(self, logits, targets):
+        """
+        Args:
+            logits: Tensor of shape (batch_size, K-1), raw outputs
+            targets: Tensor of shape (batch_size,), true labels (0~K-1)
+        """
+        batch_size, num_classes_minus1 = logits.shape
+        prob = torch.sigmoid(logits)
+
+        # 建立 target matrix (binary)
+        target_matrix = torch.zeros((batch_size, num_classes_minus1), device=logits.device)
+        for i in range(batch_size):
+            target_matrix[i, :targets[i]] = 1
+
+        # 計算 p_t (對應正負樣本)
+        pt = torch.where(target_matrix == 1, prob, 1 - prob)
+
+        # Focal weight
+        focal_weight = (1 - pt) ** self.gamma
+        alpha_t = torch.where(target_matrix == 1, self.alpha, 1 - self.alpha)
+
+        # Focal-CORAL loss matrix
+        loss_matrix = - alpha_t * focal_weight * (
+            target_matrix * torch.log(prob + 1e-8) +
+            (1 - target_matrix) * torch.log(1 - prob + 1e-8)
+        )
+
+        # 加上 class weight
+        if self.class_weights is not None:
+            sample_weights = self.class_weights[targets]  # (batch,)
+            sample_weights = sample_weights.unsqueeze(1).expand_as(loss_matrix)
+            loss_matrix = loss_matrix * sample_weights
+
+        return loss_matrix.mean()
+
+class MultiTask_CoralFocalLoss(nn.Module):
+
+    """
+    Focal-CORAL loss with optional class weights for imbalanced data.
+    """
+    def __init__(self, task_num_classes, is_learn_task_weights, class_weights=None, gamma=2.0, alpha=0.25):
+        """
+        Args:
+            class_weights: Tensor of shape (num_classes,), optional class-level weight
+            gamma: focusing parameter, typical value 2.0
+            alpha: balance parameter between positive/negative samples
+            learn_task_weights: if True, learn uncertainty-based weights for tasks
+        """
+        super(MultiTask_CoralFocalLoss, self).__init__()
+        self.task_num_classes = task_num_classes
+        self.class_weights = class_weights
+        self.gamma = gamma
+        self.alpha = alpha
+
+        if is_learn_task_weights:
+            self.log_vars = nn.ParameterDict({
+                t: nn.Parameter(torch.zeros(1)) for t in task_num_classes
+            })
+        else:
+            self.log_vars = None
+
+    def coral_focal_loss(self, logits, targets, kl_logits):
+        """
+        Args:
+            logits: Tensor of shape (batch_size, K-1), raw outputs
+            targets: Tensor of shape (batch_size,), true labels (0~K-1)
+        """
+        batch_size, num_classes_minus1 = logits.shape
+        prob = torch.sigmoid(logits)
+        if self.log_vars:
+            self.log_vars.to(logits.device)
+
+        # 建立 target matrix (binary)
+        target_matrix = torch.zeros((batch_size, num_classes_minus1), device=logits.device)
+        for i in range(batch_size):
+            target_matrix[i, :int(targets[i])] = 1
+
+        # 計算 p_t (對應正負樣本)
+        pt = torch.where(target_matrix == 1, prob, 1 - prob)
+
+        # Focal weight
+        focal_weight = (1 - pt) ** self.gamma
+        alpha_t = torch.where(target_matrix == 1, self.alpha, 1 - self.alpha)
+
+        # Focal-CORAL loss matrix
+        loss_matrix = - alpha_t * focal_weight * (
+            target_matrix * torch.log(prob + 1e-8) +
+            (1 - target_matrix) * torch.log(1 - prob + 1e-8)
+        )
+
+        # 加上 class weight
+        if self.class_weights is not None:
+            sample_weights = self.class_weights[kl_logits]  # (batch,)
+            sample_weights = sample_weights.unsqueeze(1).expand_as(loss_matrix)
+            loss_matrix = loss_matrix * sample_weights
+
+        return loss_matrix.mean()
+
+    def forward(self, outputs, targets):
+        """
+        Args:
+
+            outputs:{
+                "kl":
+                "jsnm":
+                "jsnl":
+            }
+
+            targets: dict of labels
+        """
+        total_loss = 0
+        loss_dict = {}
+
+        # print("Outputs keys:", outputs.keys())
+        for task, preds in outputs.items():
+            if task not in targets:
+                continue
+
+            l = self.coral_focal_loss(
+                preds,
+                targets[task],
+                kl_logits=targets["kl"]
+            )
+
+            if self.log_vars is not None and task in self.log_vars:
+                w = torch.exp(-self.log_vars[task].to(l.device))
+                total_loss += w * l + self.log_vars[task]
+            else:
+                total_loss += l
+
+            loss_dict[task] = l.item()
+
+        return total_loss, loss_dict
+
 def coral_predict(logits):
     """
     logits: (batch_size, K-1)
@@ -106,7 +297,66 @@ def coral_predict(logits):
     preds = torch.sum(prob > 0.5, dim=1)
     return preds
 
+def coral_multitask_predict(outputs):
+    """
+    outputs: dict of task_name -> logits
+    returns: dict of task_name -> predicted labels
+    """
+    preds = {}
+    for task, logits in outputs.items():
+        preds[task] = coral_predict(logits)
+    return preds
 
+def compute_effective_class_weights(labels, num_classes, beta=0.9999):
+    """
+    計算 CORAL loss 每個 threshold 的 effective class weight
+    
+    Args:
+        labels: (N,) tensor，包含 ordinal label，例如 [0,1,2,3,4]
+        num_classes: 總類別數 (K)，例如 5
+        beta: smoothing 參數，越接近1，越強調小樣本類別
+    
+    Returns:
+        weights_per_threshold: list of (pos_weight, neg_weight) for each threshold
+                               長度為 K-1
+    """
+    # print("Computing effective class weights for ", labels)
+    N = labels.sum()
+    weights_per_threshold = []
+
+    for k in range(num_classes - 1):  # K-1 個 threshold
+        # 定義正負樣本
+        pos_idx = labels[k+1:].sum()
+        neg_idx = N - pos_idx
+        # print("pos_idx :", pos_idx )
+        # print("neg_idx :", neg_idx )
+
+        n_pos = np.sum(pos_idx)
+        n_neg = np.sum(neg_idx)
+
+        # 避免除零
+        n_pos = max(1, n_pos)
+        n_neg = max(1, n_neg)
+
+        # effective number (Cui et al. 2019)
+        eff_pos = (1 - beta) / (1 - beta**n_pos)
+        eff_neg = (1 - beta) / (1 - beta**n_neg)
+
+        # 取倒數當 weight
+        w_pos = 1.0 / eff_pos
+        w_neg = 1.0 / eff_neg
+
+        # w_pos = w_pos ** 2
+        # w_neg = w_neg ** 2
+
+        # normalize，避免 scale 差太多
+        s = w_pos + w_neg
+        w_pos /= s
+        w_neg /= s
+
+        weights_per_threshold.append((w_pos, w_neg))
+
+    return weights_per_threshold
 # ---------------- Utilities ---------------- #
 def calculate_mean_std(h5_file, sample_groups, save_path):
     num_channels = 1
@@ -133,10 +383,13 @@ def calculate_mean_std(h5_file, sample_groups, save_path):
     return mean, std
 
 
-def run_epoch(loader, model, model_org, criterion, optimizer, device, is_training, training_type, feedback_type, desc=""):
+def run_epoch(loader, model, model_org, criterion, optimizer, device, is_training, training_type, feedback_type, oai_task_num_classes=None, desc=""):
     gradcam_type = training_type
     model.train() if is_training else model.eval()
     total_loss, all_preds, all_labels, num_processed_samples = 0.0, [], [], 0
+    if feedback_type in [14]:
+        all_preds = {task: [] for task in oai_task_num_classes.keys()}
+        all_labels = {task: [] for task in oai_task_num_classes.keys()}
     progress_bar = tqdm(loader, desc=desc, leave=False)
 
 
@@ -213,20 +466,27 @@ def run_epoch(loader, model, model_org, criterion, optimizer, device, is_trainin
 
 
         with torch.set_grad_enabled(is_training): # Context manager for gradients
+            
 
-            if feedback_type == 7 or feedback_type == 8 or feedback_type == 9 or feedback_type == 10:
-                outputs = model(moved_list_of_patch_bags, model_org, attention_tool, moved_list_of_features) # Model takes the list of bags
-            elif feedback_type == 11:
-                outputs, _, _, _ = model(moved_list_of_patch_bags) # Model takes the list of bags
-
+            if feedback_type in [14]:
+                outputs = model(moved_list_of_patch_bags) # Model takes the list of bags
+                if outputs["kl"].shape[0] != labels_batch.shape[0]:
+                    print(f"Shape mismatch in {desc}! Outputs: {outputs.shape}, Labels: {labels_batch.shape}. Skipping batch.")
+                    print(f"  Original num bags in list: {len(list_of_patch_bags)}, Moved: {len(moved_list_of_patch_bags)}")
+                    continue
             else:
-                outputs, _, _, _, _, _ = model(moved_list_of_patch_bags, model_org, attention_tool) # Model takes the list of bags
+                if feedback_type in [7, 8, 9, 10]: 
+                    outputs = model(moved_list_of_patch_bags, model_org, attention_tool, moved_list_of_features) # Model takes the list of bags
+                elif feedback_type in [11, 12, 13]: # ordinal
+                    outputs, _, _, _ = model(moved_list_of_patch_bags) # Model takes the list of bags
+                else:
+                    outputs, _, _, _, _, _ = model(moved_list_of_patch_bags, model_org, attention_tool) # Model takes the list of bags
 
-            # Ensure outputs and labels match in size after potential filtering
-            if outputs.shape[0] != labels_batch.shape[0]:
-                print(f"Shape mismatch in {desc}! Outputs: {outputs.shape}, Labels: {labels_batch.shape}. Skipping batch.")
-                print(f"  Original num bags in list: {len(list_of_patch_bags)}, Moved: {len(moved_list_of_patch_bags)}")
-                continue
+                # Ensure outputs and labels match in size after potential filtering
+                if outputs.shape[0] != labels_batch.shape[0]:
+                    print(f"Shape mismatch in {desc}! Outputs: {outputs.shape}, Labels: {labels_batch.shape}. Skipping batch.")
+                    print(f"  Original num bags in list: {len(list_of_patch_bags)}, Moved: {len(moved_list_of_patch_bags)}")
+                    continue
 
             # print("labels_batch:", labels_batch)
             # for k in moved_list_of_features:
@@ -241,8 +501,37 @@ def run_epoch(loader, model, model_org, criterion, optimizer, device, is_trainin
             # print("labels_batch:", labels_batch)
             # for k in moved_list_of_features:
             #     print("moved_list_of_features:", k)  # Debugging line to check the features being passed
-            
-            loss = criterion(outputs, labels_batch)
+            targets = {}
+            if feedback_type in [14]:
+                kl_labels   = torch.tensor([l for l in labels_batch], device=labels_batch.device)
+                jsnm_labels = torch.tensor([f[0] for f in moved_list_of_features], device=labels_batch.device)
+                jsnl_labels = torch.tensor([f[1] for f in moved_list_of_features], device=labels_batch.device)
+                
+                osfm_labels = torch.tensor([f[2] for f in moved_list_of_features], device=labels_batch.device)
+                ostm_labels = torch.tensor([f[3] for f in moved_list_of_features], device=labels_batch.device)
+                ostl_labels = torch.tensor([f[4] for f in moved_list_of_features], device=labels_batch.device)
+                osfl_labels = torch.tensor([f[5] for f in moved_list_of_features], device=labels_batch.device)
+
+                # Mask: KL == 1 & OS == -999 → set OS to 0
+                mask = (kl_labels == 1)
+                osfm_labels = torch.where(mask & (osfm_labels == -999), torch.tensor(0, device=osfm_labels.device), osfm_labels)
+                ostm_labels = torch.where(mask & (ostm_labels == -999), torch.tensor(0, device=ostm_labels.device), ostm_labels)
+                ostl_labels = torch.where(mask & (ostl_labels == -999), torch.tensor(0, device=ostl_labels.device), ostl_labels)
+                osfl_labels = torch.where(mask & (osfl_labels == -999), torch.tensor(0, device=osfl_labels.device), osfl_labels)
+
+
+                targets.update({
+                    "kl": kl_labels,
+                    "jsnm": jsnm_labels,
+                    "jsnl": jsnl_labels,
+                    "osfm": osfm_labels,
+                    "ostm": ostm_labels,
+                    "ostl": ostl_labels,
+                    "osfl": osfl_labels,                    
+                })
+                loss, loss_dict = criterion(outputs, targets)
+            else:
+                loss = criterion(outputs, labels_batch)
 
             if is_training:
                 loss.backward()
@@ -251,12 +540,20 @@ def run_epoch(loader, model, model_org, criterion, optimizer, device, is_trainin
         total_loss += loss.item() * labels_batch.size(0) # loss.item() is avg loss for batch
         num_processed_samples += labels_batch.size(0)
 
-        if feedback_type == 11:
-            predicted = coral_predict(outputs) # logits
+
+        if feedback_type in [14]:
+            predicted = coral_multitask_predict(outputs) # dict of logits
+            for task in oai_task_num_classes.keys():
+                all_preds[task].extend(predicted[task].cpu().numpy())
+                all_labels[task].extend(targets[task].cpu().numpy())
         else:
-            _, predicted = torch.max(outputs.data, 1)
-        all_preds.extend(predicted.cpu().numpy())
-        all_labels.extend(labels_batch.cpu().numpy())
+            if feedback_type in [11, 12, 13]:
+                predicted = coral_predict(outputs) # logits
+            else:
+                _, predicted = torch.max(outputs.data, 1)
+
+            all_preds.extend(predicted.cpu().numpy())
+            all_labels.extend(labels_batch.cpu().numpy())
 
         if progress_bar:
             progress_bar.set_postfix(loss=loss.item())
@@ -271,7 +568,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--training_type", type=str, default="original", choices=["original", "GradCAM", "GradCAMPlusPlus", "ScoreCAM", "AblationCAM", "LayerCAM"])
     parser.add_argument("--pre_ckpt", type=str, default="PRE_CHECKPOINT_DIR")
-    parser.add_argument("--feedback_type", type=int, default=1, choices=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], help="1: (w*cam*p + p), 2: (w(cam*p + p)), 3: (w*cam*p), 4: (w*cam*p + p), 5: (w*cam*p + w*p)")
+    parser.add_argument("--feedback_type", type=int, default=1, choices=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14], help="1: (w*cam*p + p), 2: (w(cam*p + p)), 3: (w*cam*p), 4: (w*cam*p + p), 5: (w*cam*p + w*p)")
     parser.add_argument("--note", type=str, default="", help="Additional note for the run name")
 
     num_features = 6
@@ -381,7 +678,7 @@ if __name__ == '__main__':
     val_pids = val.tolist()
     test_pids = test.tolist()
 
-    # test_pids.remove("9491446_R") # bad image
+    test_pids.remove("9491446_R") # bad image
 
     print(f"Total KNEE samples for training: {len(train_pids)}")
     print(f"Total KNEE samples for validation: {len(val_pids)}")
@@ -438,8 +735,16 @@ if __name__ == '__main__':
 
 
     # 6. Model, Loss, Optimizer
-    if feedback_type == 11: # ordinal model
+    if feedback_type in [11, 12, 13]: # ordinal model
         model = CompleteMILOrdinalModel(FEATURE_EXTRACTOR_OUT_DIM, NUM_CLASSES, AGGREGATION_TYPE).to(DEVICE)
+        model_org = None
+    elif feedback_type in [14]: # multitask
+        oai_task_num_classes={
+            "kl": 5,   # 0–4 ordinal
+            "jsnm": 4,  # 0–3 ordinal
+            "jsnl": 4,  # 0–3 ordinal
+        }
+        model = CompleteMILOrdinal_MultiTask_Model(FEATURE_EXTRACTOR_OUT_DIM, NUM_CLASSES, oai_task_num_classes, AGGREGATION_TYPE).to(DEVICE)
         model_org = None
     else:
         model = CompleteMILCamModel_Attention_feedback(FEATURE_EXTRACTOR_OUT_DIM, NUM_CLASSES, training_type, feedback_type, AGGREGATION_TYPE, num_features=num_features).to(DEVICE)
@@ -464,13 +769,35 @@ if __name__ == '__main__':
 
     class_counts = np.bincount(train_kl_grades, minlength=NUM_CLASSES)
     # Avoid division by zero if a class is missing in training (should ideally not happen with good splits)
-    class_weights_raw = 1.0 / (class_counts + 1e-6) # Add epsilon for stability
-    class_weights_normalized = class_weights_raw / np.sum(class_weights_raw) * NUM_CLASSES # Optional normalization
-    class_weights_tensor = torch.tensor(class_weights_normalized, dtype=torch.float).to(DEVICE)
-    print(f"Using class weights: {class_weights_tensor}")
+    # class_weights_raw = 1.0 / (class_counts + 1e-6) # Add epsilon for stability
+    # class_weights_raw[1] *= 2.0 # Double the weight for class 1
+    # class_weights_normalized = class_weights_raw / np.sum(class_weights_raw) * NUM_CLASSES # Optional normalization
+    # class_weights_tensor = torch.tensor(class_weights_normalized, dtype=torch.float).to(DEVICE)
 
+    print(f"Class counts in training set: {class_counts}")
+    
+    if feedback_type in [13]: # class weights
+        class_weights = compute_effective_class_weights(class_counts, num_classes=NUM_CLASSES, beta=0.9999)
+        class_weights = np.array(class_weights)
+        class_weights[1, :] = [class_weights[1,0]*2.0, class_weights[1,1]*2.0] # Double the weight for class 1
+        class_weights_tensor = torch.tensor(class_weights, dtype=torch.float).to(DEVICE)
+    else: # sample weights
+        class_weights_raw = 1.0 / (class_counts + 1e-6) # Add epsilon for stability
+        # class_weights_raw[1] *= 2.0 # Double the weight for class 1
+        class_weights_normalized = class_weights_raw / np.sum(class_weights_raw) * NUM_CLASSES # Optional normalization
+        class_weights_tensor = torch.tensor(class_weights_normalized, dtype=torch.float).to(DEVICE)
+
+    print(f"Using class weights: {class_weights_tensor}")
     if feedback_type == 11:
         criterion = CoralLossWeighted(class_weights=class_weights_tensor)
+    elif feedback_type == 12:
+        criterion = CoralFocalLoss(class_weights=class_weights_tensor, gamma=2.0, alpha=0.25)
+
+    elif feedback_type == 13:
+        criterion = CoralLossEffective(threshold_weights=class_weights_tensor)
+    elif feedback_type == 14:
+        criterion = MultiTask_CoralFocalLoss(oai_task_num_classes, is_learn_task_weights=True, class_weights=class_weights_tensor)
+
     else:
         criterion = nn.CrossEntropyLoss(weight=class_weights_tensor)
 
@@ -480,7 +807,11 @@ if __name__ == '__main__':
     best_val_accuracy = 0.0
     best_val_loss = np.inf
     best_val_kappa = -1.0
+    best_val_f1 = 0.0
 
+    best_val_accuracy_kl = 0.0
+    best_val_kappa_kl = -1.0
+    best_val_f1_kl = 0.0
     best_model_path_fixed = os.path.join(CHECKPOINT_DIR, "best_model.pth") # Fixed name for best model
 
 
@@ -493,13 +824,42 @@ if __name__ == '__main__':
 
         # Training phase
         train_loss, train_labels, train_preds, processed_train_samples = run_epoch(
-            train_loader, model, model_org, criterion, optimizer, DEVICE, is_training=True, training_type=training_type, feedback_type=feedback_type,
+            train_loader, model, model_org, criterion, optimizer, DEVICE, is_training=True, training_type=training_type, feedback_type=feedback_type, oai_task_num_classes=oai_task_num_classes,
             desc=f"Epoch {epoch_num}/{NUM_EPOCHS} [Train]"
         )
         if processed_train_samples > 0:
-            train_accuracy = accuracy_score(train_labels, train_preds)
-            train_f1 = f1_score(train_labels, train_preds, average='weighted', zero_division=0)
-            train_kappa = cohen_kappa_score(train_labels, train_preds, weights="quadratic") # Added Kappa
+            if feedback_type in [14]:
+                task_accuracy = {}
+                task_f1 = {}
+                task_kappa = {}
+                for task in train_labels.keys():
+                    labels = train_labels[task]
+                    preds = train_preds[task]
+                    acc = accuracy_score(labels, preds)
+                    f1 = f1_score(labels, preds, average='weighted', zero_division=0)
+                    kappa = cohen_kappa_score(labels, preds, weights="quadratic")
+                    task_accuracy[task] = acc
+                    task_f1[task] = f1
+                    task_kappa[task] = kappa
+            
+                    if WANDB:
+                        wandb.log({
+                            f"train/{task}_accuracy": acc,
+                            f"train/{task}_f1_weighted": f1,
+                            f"train/{task}_kappa": kappa,
+                            "epoch": epoch_num
+                        })
+                    print(f"[Train] {task} - Acc: {acc:.4f}, F1: {f1:.4f}, Kappa: {kappa:.4f}")
+
+                # aggregate across tasks (mean of metrics)
+                train_accuracy = np.mean(list(task_accuracy.values()))
+                train_f1 = np.mean(list(task_f1.values()))
+                train_kappa = np.mean(list(task_kappa.values()))
+            else:
+                train_accuracy = accuracy_score(train_labels, train_preds)
+                train_f1 = f1_score(train_labels, train_preds, average='weighted', zero_division=0)
+                train_kappa = cohen_kappa_score(train_labels, train_preds, weights="quadratic") # Added Kappa
+            
             if WANDB:
                 wandb.log({
                     "train/loss": train_loss,
@@ -509,22 +869,52 @@ if __name__ == '__main__':
                     "learning_rate": current_lr,
                     "epoch": epoch_num
                 })
-            print(f"Epoch {epoch_num} Train Loss: {train_loss:.4f}, Train Acc: {train_accuracy:.4f}, Train F1: {train_f1:.4f}, Train Kappa: {train_kappa:.4f}")
+                print(f"Epoch {epoch_num} Train Loss: {train_loss:.4f}, Train Acc: {train_accuracy:.4f}, Train F1: {train_f1:.4f}, Train Kappa: {train_kappa:.4f}")
         else:
             print(f"Epoch {epoch_num} - No samples processed during training.")
 
         # Validation phase
+        # No optimizer needed for validation
         val_loss, val_labels, val_preds, processed_val_samples = run_epoch(
-            val_loader, model, model_org, criterion, None, DEVICE, is_training=False, training_type=training_type, feedback_type=feedback_type, # No optimizer needed for validation
+            val_loader, model, model_org, criterion, None, DEVICE, is_training=False, training_type=training_type, feedback_type=feedback_type, oai_task_num_classes=oai_task_num_classes,
             desc=f"Epoch {epoch_num}/{NUM_EPOCHS} [Val]"
         )
 
         scheduler.step(val_loss)
 
         if processed_val_samples > 0:
-            val_accuracy = accuracy_score(val_labels, val_preds)
-            val_f1 = f1_score(val_labels, val_preds, average='weighted', zero_division=0)
-            val_kappa = cohen_kappa_score(val_labels, val_preds, weights="quadratic") # Added Kappa
+            if feedback_type in [14]:
+                task_accuracy = {}
+                task_f1 = {}
+                task_kappa = {}
+                for task in val_labels.keys():
+                    labels = val_labels[task]
+                    preds = val_preds[task]
+                    acc = accuracy_score(labels, preds)
+                    f1 = f1_score(labels, preds, average='weighted', zero_division=0)
+                    kappa = cohen_kappa_score(labels, preds, weights="quadratic")
+                    task_accuracy[task] = acc
+                    task_f1[task] = f1
+                    task_kappa[task] = kappa
+            
+                    if WANDB:
+                        wandb.log({
+                            f"val/{task}_accuracy": acc,
+                            f"val/{task}_f1_weighted": f1,
+                            f"val/{task}_kappa": kappa,
+                            "epoch": epoch_num
+                        })
+                    print(f"[Val] {task} - Acc: {acc:.4f}, F1: {f1:.4f}, Kappa: {kappa:.4f}")
+
+                # aggregate across tasks (mean of metrics)
+                val_accuracy = np.mean(list(task_accuracy.values()))
+                val_f1 = np.mean(list(task_f1.values()))
+                val_kappa  = np.mean(list(task_kappa.values()))
+            else:
+                val_accuracy = accuracy_score(val_labels, val_preds)
+                val_f1 = f1_score(val_labels, val_preds, average='weighted', zero_division=0)
+                val_kappa = cohen_kappa_score(val_labels, val_preds, weights="quadratic") # Added Kappa
+            
             if WANDB:
                 wandb.log({
                     "val/loss": val_loss,
@@ -542,17 +932,42 @@ if __name__ == '__main__':
                         os.path.join(CHECKPOINT_DIR, f"best_model_{training_type}_val_acc.pth"))
                 print(f"  Saved new best acc model ({training_type}) (Val Acc: {val_accuracy:.4f})")
 
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
+            if val_f1 > best_val_f1:
+                best_val_f1 = val_f1
                 torch.save(model.state_dict(),
-                        os.path.join(CHECKPOINT_DIR, f"best_model_{training_type}_val_loss.pth"))
-                print(f"  Saved new best loss model ({training_type}) (Val loss: {val_loss:.4f})")
+                        os.path.join(CHECKPOINT_DIR, f"best_model_{training_type}_val_f1.pth"))
+                print(f"  Saved new best f1 model ({training_type}) (Val F1: {val_f1:.4f})")
 
             if val_kappa > best_val_kappa:
                 best_val_kappa = val_kappa
                 torch.save(model.state_dict(),
                         os.path.join(CHECKPOINT_DIR, f"best_model_{training_type}_val_kappa.pth"))
                 print(f"  Saved new best kappa model ({training_type}) (Val kappa: {val_kappa:.4f})")
+            
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                torch.save(model.state_dict(),
+                        os.path.join(CHECKPOINT_DIR, f"best_model_{training_type}_val_loss.pth"))
+                print(f"  Saved new best loss model ({training_type}) (Val loss: {val_loss:.4f})")
+
+            if "kl" in task_accuracy:
+                if task_accuracy["kl"] > best_val_accuracy_kl:
+                    best_val_accuracy_kl = task_accuracy["kl"]
+                    torch.save(model.state_dict(),
+                            os.path.join(CHECKPOINT_DIR, f"best_model_{training_type}_kl_val_acc.pth"))
+                    print(f"  Saved new best KL acc model ({training_type}) (KL Acc: {task_accuracy['kl']:.4f})")
+
+                if task_kappa["kl"] > best_val_kappa_kl:
+                    best_val_kappa_kl = task_kappa["kl"]
+                    torch.save(model.state_dict(),
+                            os.path.join(CHECKPOINT_DIR, f"best_model_{training_type}_kl_val_kappa.pth"))
+                    print(f"  Saved new best KL kappa model ({training_type}) (KL Kappa: {task_kappa['kl']:.4f})")
+                
+                if task_f1["kl"] > best_val_f1_kl:
+                    best_val_f1_kl = task_f1["kl"]
+                    torch.save(model.state_dict(),
+                            os.path.join(CHECKPOINT_DIR, f"best_model_{training_type}_kl_val_f1.pth"))
+                    print(f"  Saved new best KL F1 model ({training_type}) (KL F1: {task_f1['kl']:.4f})")
         else:
             print(f"Epoch {epoch_num} - No samples processed during validation.")
         print("-" * 60)
