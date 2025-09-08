@@ -2,6 +2,11 @@ from torch import nn
 import torch
 import torch.nn.functional as F
 import numpy as np
+from enum import Enum
+
+class LossType(Enum):
+    ORDINAL = 1
+    ORDINAL_AND_FOCAL = 2
 
 class CoralLossWeighted(nn.Module):
     """
@@ -27,6 +32,7 @@ class CoralLossWeighted(nn.Module):
 
         # 建立 target matrix (binary)
         target_matrix = torch.zeros((batch_size, num_classes_minus1), device=logits.device)
+        
         for i in range(batch_size):
             target_matrix[i, :targets[i]] = 1
 
@@ -67,7 +73,7 @@ class CoralLossEffective(nn.Module):
         batch_size, num_classes_minus1 = logits.shape
         prob = torch.sigmoid(logits)
 
-        # target_matrix: (batch_size, K-1)
+        # target_matrix: (batch_size, K-1)\
         target_matrix = torch.zeros((batch_size, num_classes_minus1), device=logits.device)
         for i in range(batch_size):
             target_matrix[i, :targets[i]] = 1
@@ -191,11 +197,10 @@ class MultiTask_CoralFocalLoss(nn.Module):
             (1 - target_matrix) * torch.log(1 - prob + 1e-8)
         )
 
-        # 加上 class weight
         if self.class_weights is not None:
-            sample_weights = self.class_weights[kl_logits]  # (batch,)
-            sample_weights = sample_weights.unsqueeze(1).expand_as(loss_matrix)
-            loss_matrix = loss_matrix * sample_weights
+            # sample_weights: [batch] -> [batch, 1] so it can broadcast along num_classes
+            sample_weights = self.class_weights[kl_logits].view(-1, 1) 
+            loss_matrix = loss_matrix * sample_weights  # broadcast automatically
 
         return loss_matrix.mean()
 
@@ -226,14 +231,6 @@ class MultiTask_CoralFocalLoss(nn.Module):
             )
             
             total_loss += l
-
-            # if self.log_vars is not None and task in self.log_vars:
-            #     # w = torch.exp(-self.log_vars[task].to(l.device))
-            #     w = torch.exp(-self.log_vars[task])
-            #     total_loss += w * l + self.log_vars[task]
-            # else:
-            #     total_loss += l
-
             loss_dict[task] = l.item()
 
         total_loss = total_loss / len(outputs)  # average over tasks
@@ -246,7 +243,6 @@ def coral_predict(logits):
     return: predicted class (batch_size,)
     """
     prob = torch.sigmoid(logits)   # (batch, K-1)
-    # 檢查從左到右哪個 cutpoint 變成 <0.5
     preds = torch.sum(prob > 0.5, dim=1)
     return preds
 
@@ -259,16 +255,3 @@ def coral_multitask_predict(outputs):
     for task, logits in outputs.items():
         preds[task] = coral_predict(logits)
     return preds
-
-
-def get_criterion(feedback_type, class_weights_tensor, oai_task_num_classes=None):
-    if feedback_type == 11:
-        return CoralLossWeighted(class_weights=class_weights_tensor)
-    elif feedback_type == 12:
-        return CoralFocalLoss(class_weights=class_weights_tensor, gamma=2.0, alpha=0.25)
-    elif feedback_type == 13:
-        return CoralLossEffective(threshold_weights=class_weights_tensor)
-    elif feedback_type == 14:
-        return MultiTask_CoralFocalLoss(oai_task_num_classes, is_learn_task_weights=True, class_weights=class_weights_tensor)
-    else:
-        return nn.CrossEntropyLoss(weight=class_weights_tensor)

@@ -1,13 +1,13 @@
+from html import parser
 import os
 import torch
 import argparse
 from datetime import datetime
+import json
 
 # ---------------- Default Configuration ---------------- #
 NOW = datetime.now().strftime('%Y%m%d_%H%M%S')
 
-DEBUG_MODE = False
-WANDB = not DEBUG_MODE
 DATA_HALF = False
 
 # Dataset / Checkpoints
@@ -45,27 +45,76 @@ PIN_MEMORY = DEVICE.type == "cuda" and NUM_WORKERS > 0
 # ---------------- Argument Parser ---------------- #
 def get_args():
     parser = argparse.ArgumentParser()
-
     # Experiment setup
+    parser.add_argument("--use_baseline", action="store_true", help="Use baseline MIL model")
+    parser.add_argument("--debug", action="store_true", help="Debug mode")
     parser.add_argument(
-        "--training_type",
+            "--model_type",
+            type=str,
+            choices=["MIL", "MTLOrdinal", "MTLOrdinal_MultiTask"],
+            default="MIL",
+            help= "Choose the MIL model type"
+        )
+
+    # Loss function type
+    parser.add_argument(
+        "--lossfcn_type",
         type=str,
-        default="original",
-        choices=["original", "GradCAM", "GradCAMPlusPlus", "ScoreCAM", "AblationCAM", "LayerCAM"]
+        choices=["CrossEntropy", "CoralLossWeighted", "CoralFocalLoss_MultiTask", "CoralLossEffective"],
+        default="OrdinalMSE",
+        help="Choose the loss function"
     )
+
+    parser.add_argument(
+        "--predict_criteria",
+        type=str, 
+        choices=["Max", "Coral_Multitask", "Coral"],
+        default="Max"
+    )
+
+    # Multitask type
+    parser.add_argument(
+        "--multitask_type",
+        type=str,
+        choices=["off", "kl_jsn", "all"],
+        default="off",
+        help="Choose the tpye of multitask"
+    )
+
+    parser.add_argument(
+        "--classweight_type",
+        type=str,
+        choices = ["inv", "effective"], # effective has positive and negative
+        default="inv"
+
+    )
+    
+    # feedback type
+    parser.add_argument(
+        "--feedback_type",
+        type=str,
+        choices=["off", "on"],
+        default="off",
+        help="whether use feedback"
+    )
+
+    # CAM type
+    parser.add_argument(
+        "--feedback_cam",
+        type=str,
+        choices=["off", "GradCAM", "GradCAMPlusPlus", "ScoreCAM", "AblationCAM", "LayerCAM"],
+        default="off",
+        help= "Choose the CAM method, select 'off' if not using CAM"
+    )
+
+    # pretrained checkpoint path
     parser.add_argument(
         "--pre_ckpt",
         type=str,
-        default=DEFAULT_PRE_CKPT_DIR,
-        help="Path to pretrained checkpoint dir"
+        default=None,
+        help="Path to pretrained checkpoint dir (required if feedback_type is 'on')"
     )
-    parser.add_argument(
-        "--feedback_type",
-        type=int,
-        default=1,
-        choices=list(range(1, 15)),
-        help="Feedback strategy (1–14)"
-    )
+    
     parser.add_argument(
         "--note",
         type=str,
@@ -73,19 +122,12 @@ def get_args():
         help="Additional note for experiment naming"
     )
 
-    parser.add_argument("--use_baseline", action="store_true", help="Use baseline MIL model")
-    parser.add_argument("--use_ordinal", action="store_true", help="Use ordinal MIL loss")
-    parser.add_argument("--use_weighted_cam", action="store_true", help="Use weighted CAM mechanism")
-    parser.add_argument("--use_multitask", action="store_true", help="Enable multitask learning")
-
-    parser.add_argument(
-        "--num_features",
-        type=int,
-        default=6,
-        help="Number of OARSI features used in multitask mode"
-    )
-
     args = parser.parse_args()
+
+    if args.feedback_type == "on" and not args.pre_ckpt:
+        parser.error("feedback_type='on' requires --pre_ckpt to be specified.")
+    
+    
     return args
 
 
@@ -100,24 +142,42 @@ def build_config():
     data_part = "halfdata" if DATA_HALF else "wholedata"
 
     # timestamp + run_name
-    timestamp = datetime.now().strftime('%m%d_%H%M')
-    run_name = (
-        f"{args.training_type}_lr{LEARNING_RATE:.0e}_b{BATCH_SIZE}_{timestamp}"
-        f"_feedback_{args.feedback_type}_{data_part}_{args.note}_feat_{num_features}"
-    )
 
+    loss_map = {"CrossEntropy": "CE", "CoralLossWeighted": "CLW", 
+                "CoralFocalLoss_MultiTask": "MCFL", "CoralLossEffective": "CLE"}
+    mtask_map = {"off": "0", "kl_jsn": "KJ", "all": "A"}
+    cam_map = {"off": "0", "GradCAM": "GC", "GradCAMPlusPlus": "GPP", 
+            "ScoreCAM": "SC", "AblationCAM": "AC", "LayerCAM": "LC"}
+
+    run_name = (
+        f"{NOW}_{args.model_type}"
+        f"_L{loss_map[args.lossfcn_type]}"
+        f"_M{mtask_map[args.multitask_type]}"
+        f"_C{cam_map[args.feedback_cam]}"
+        f"_F{args.feedback_type[0]}"   # o / n
+        f"_lr{LEARNING_RATE:.0e}_b{BATCH_SIZE}"
+        f"_{args.note}"
+    )
     # checkpoint dir
     checkpoint_dir = os.path.join(
         "original_data",
         "V00",
-        f"model_checkpoints_{NOW}_epoch{NUM_EPOCHS}_finalckpt_100_feedback_{args.feedback_type}_{args.note}_feat_{num_features}"
+        f"model_checkpoints_{NOW}_epoch{NUM_EPOCHS}_{args.model_type}_L{loss_map[args.lossfcn_type]}_M{mtask_map[args.multitask_type]}_C{cam_map[args.feedback_cam]}_F{args.feedback_type[0]}_lr{LEARNING_RATE:.0e}_b{BATCH_SIZE}"
     )
+
+    if args.multitask_type == "all":
+        OARSI_TASKS  = {
+            "kl": 5, "jsnm": 4, "jsnl": 4, "osfm": 4, "ostm": 4, "ostl": 4, "osfl": 4
+        }
+    elif args.multitask_type == "kl_jsn":
+        OARSI_TASKS = {
+            "kl": 5, "jsnm": 4, "jsnl": 4
+        }
 
     config = {
         # experiment setup
-        "NOW": NOW,
-        "DEBUG_MODE": DEBUG_MODE,
-        "WANDB": WANDB,
+        "DEBUG_MODE": args.debug,
+        "WANDB": not args.debug,
         "DATA_HALF": DATA_HALF,
 
         # dataset paths
@@ -145,27 +205,34 @@ def build_config():
         "NUM_FEATURES": NUM_FEATURES,
 
         # Ablation study
-        "baseline": args.use_baseline,
-        "weighted_cam": args.use_weighted_cam,
-        "ordinal": args.use_ordinal,
-        "multitask": args.use_multitask,
+        "model_type": args.model_type, # "MIL", "MTLOrdinal", "MTLOrdinal_MultiTask"
+        "lossfcn_type": args.lossfcn_type, # "CoralLossWeighted", "OrdinalAndFocal", "OrdinalMSE", 
+        "multitask_type": args.multitask_type, # "off", "kl", "kl_jsn", "all"
+        "feedback_type": args.feedback_type, # "off", "on"
+        "feedback_cam": args.feedback_cam, # "GradCAM", "GradCAMPlusPlus", "ScoreCAM", "AblationCAM", "LayerCAM"
+        "classweight_type": args.classweight_type, 
+        "predict_criteria": args.predict_criteria,
 
         # device
         "DEVICE": DEVICE,
         "NUM_WORKERS": NUM_WORKERS,
         "PIN_MEMORY": PIN_MEMORY,
-
-        # args
-        "training_type": args.training_type,
-        "feedback_type": args.feedback_type,
-        "note": args.note,
-
+        
         # info
-        "timestamp": timestamp,
+        "NOW": NOW,
         "run_name": run_name,
+        "note": args.note,
     }
 
     # make dirs if needed
     os.makedirs(config["CHECKPOINT_DIR"], exist_ok=True)
+
+    config["DEVICE"] = str(DEVICE)
+    config_path = os.path.join(config["CHECKPOINT_DIR"], "config.json")
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=4)
+    print(f"Config saved to: {config_path}")
+
+    config["DEVICE"] = DEVICE
 
     return config
