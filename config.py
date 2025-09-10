@@ -3,7 +3,7 @@ import os
 import torch
 import argparse
 from datetime import datetime
-import json
+
 
 # ---------------- Default Configuration ---------------- #
 NOW = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -46,12 +46,13 @@ PIN_MEMORY = DEVICE.type == "cuda" and NUM_WORKERS > 0
 def get_args():
     parser = argparse.ArgumentParser()
     # Experiment setup
+    parser.add_argument("--current_ckpt", type=str, default=None)
     parser.add_argument("--use_baseline", action="store_true", help="Use baseline MIL model")
     parser.add_argument("--debug", action="store_true", help="Debug mode")
     parser.add_argument(
             "--model_type",
             type=str,
-            choices=["MIL", "MTLOrdinal", "MTLOrdinal_MultiTask"],
+            choices=["MIL", "MTLOrdinal", "MTLOrdinal_MultiTask", "MTLCoral_MultiTask"],
             default="MIL",
             help= "Choose the MIL model type"
         )
@@ -60,7 +61,7 @@ def get_args():
     parser.add_argument(
         "--lossfcn_type",
         type=str,
-        choices=["CrossEntropy", "CoralLossWeighted", "CoralFocalLoss_MultiTask", "CoralLossEffective"],
+        choices=["CrossEntropy", "CoralLoss_MultiTask", "CoralLossWeighted", "CoralFocalLoss_MultiTask", "CoralLossEffective"],
         default="OrdinalMSE",
         help="Choose the loss function"
     )
@@ -114,7 +115,11 @@ def get_args():
         default=None,
         help="Path to pretrained checkpoint dir (required if feedback_type is 'on')"
     )
-    
+    parser.add_argument(
+        "--inference_target",
+        type=str,
+        default="kl"
+    )
     parser.add_argument(
         "--note",
         type=str,
@@ -143,8 +148,8 @@ def build_config():
 
     # timestamp + run_name
 
-    loss_map = {"CrossEntropy": "CE", "CoralLossWeighted": "CLW", 
-                "CoralFocalLoss_MultiTask": "MCFL", "CoralLossEffective": "CLE"}
+    loss_map = {"CrossEntropy": "CE", "CoralLoss_MultiTask": "CLoM", "CoralLossWeighted": "CLoW", 
+                "CoralFocalLoss_MultiTask": "CFLoM", "CoralLossEffective": "CLoE"}
     mtask_map = {"off": "0", "kl_jsn": "KJ", "all": "A"}
     cam_map = {"off": "0", "GradCAM": "GC", "GradCAMPlusPlus": "GPP", 
             "ScoreCAM": "SC", "AblationCAM": "AC", "LayerCAM": "LC"}
@@ -158,12 +163,21 @@ def build_config():
         f"_lr{LEARNING_RATE:.0e}_b{BATCH_SIZE}"
         f"_{args.note}"
     )
+
     # checkpoint dir
-    checkpoint_dir = os.path.join(
-        "original_data",
-        "V00",
-        f"model_checkpoints_{NOW}_epoch{NUM_EPOCHS}_{args.model_type}_L{loss_map[args.lossfcn_type]}_M{mtask_map[args.multitask_type]}_C{cam_map[args.feedback_cam]}_F{args.feedback_type[0]}_lr{LEARNING_RATE:.0e}_b{BATCH_SIZE}"
-    )
+    if args.current_ckpt:
+        checkpoint_dir = os.path.join(
+            "original_data",
+            "V00",
+            args.current_ckpt
+        )
+
+    else:
+        checkpoint_dir = os.path.join(
+            "original_data",
+            "V00",
+            f"model_checkpoints_{NOW}_epoch{NUM_EPOCHS}_{args.model_type}_L{loss_map[args.lossfcn_type]}_M{mtask_map[args.multitask_type]}_C{cam_map[args.feedback_cam]}_F{args.feedback_type[0]}_lr{LEARNING_RATE:.0e}_b{BATCH_SIZE}"
+        )
 
     if args.multitask_type == "all":
         OARSI_TASKS  = {
@@ -212,6 +226,7 @@ def build_config():
         "feedback_cam": args.feedback_cam, # "GradCAM", "GradCAMPlusPlus", "ScoreCAM", "AblationCAM", "LayerCAM"
         "classweight_type": args.classweight_type, 
         "predict_criteria": args.predict_criteria,
+        "inference_target": args.inference_target,
 
         # device
         "DEVICE": DEVICE,
@@ -226,13 +241,5 @@ def build_config():
 
     # make dirs if needed
     os.makedirs(config["CHECKPOINT_DIR"], exist_ok=True)
-
-    config["DEVICE"] = str(DEVICE)
-    config_path = os.path.join(config["CHECKPOINT_DIR"], "config.json")
-    with open(config_path, "w") as f:
-        json.dump(config, f, indent=4)
-    print(f"Config saved to: {config_path}")
-
-    config["DEVICE"] = DEVICE
 
     return config

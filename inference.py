@@ -2,22 +2,21 @@ import os
 import shutil
 import numpy as np
 import h5py
-import json
+import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, ConfusionMatrixDisplay
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
 import wandb
 from config import build_config
 from dataset import KneeMILDataset, mil_collate_fn
-
 from losses import coral_predict, coral_multitask_predict
 from myutils import (
     calculate_mean_std,
     build_CAM_attention_tool,
     compute_metrics,
-    compute_class_weights,
     get_criterion,
     labels_to_levels,
     create_transforms,
@@ -26,11 +25,11 @@ from myutils import (
     get_model_org
 )
 
-
 class Config:
     def __init__(self, config_dict):
         for k, v in config_dict.items():
             setattr(self, k, v)
+
 
 def run_epoch(loader, model, model_org, criterion, optimizer, device, is_training, config, desc=""):
     """
@@ -42,10 +41,11 @@ def run_epoch(loader, model, model_org, criterion, optimizer, device, is_trainin
 
     # Prepare prediction containers
     if config.multitask_type == "off":
-        all_preds, all_labels = [], []
+        all_preds, all_labels, all_probs = [], [], []
     else:
         all_preds = {task: [] for task in config.OARSI_TASKS.keys()}
         all_labels = {task: [] for task in config.OARSI_TASKS.keys()}
+        all_probs = {task: [] for task in config.OARSI_TASKS.keys()}
         
 
     # Setup attention tool if applicable
@@ -132,108 +132,25 @@ def run_epoch(loader, model, model_org, criterion, optimizer, device, is_trainin
         # Predictions
         if config.multitask_type == "off":
             if config.predict_criteria == "Coral":
-                predicted = coral_predict(outputs)
+                predicted, probs = coral_predict(outputs)
             elif config.predict_criteria == "Max":
                 _, predicted = torch.max(outputs.data, 1)
             all_preds.extend(predicted.cpu().numpy())
             all_labels.extend(labels_batch.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
         else:
             if config.predict_criteria == "Coral_Multitask":
-                predicted = coral_multitask_predict(outputs)
+                predicted, probs = coral_multitask_predict(outputs)
+
             for task in config.OARSI_TASKS.keys():
-                all_preds[task].extend(predicted[task].cpu().numpy())
+                all_preds[task].extend(predicted[task][0].cpu().numpy())
                 all_labels[task].extend(targets[task].cpu().numpy())
+                all_probs[task].extend(probs[task][0].cpu().numpy())
 
         progress_bar.set_postfix(loss=loss.item())
 
     avg_loss = total_loss / num_processed_samples if num_processed_samples > 0 else 0
-    return avg_loss, all_labels, all_preds, num_processed_samples
-
-
-    
-def save_checkpoint(model, checkpoint_dir, name):
-    path = os.path.join(checkpoint_dir, name)
-    torch.save(model.state_dict(), path)
-    print(f"Saved checkpoint: {path}")
-
-
-    
-def log_metrics(metrics_dict, prefix, epoch, use_wandb=True):
-    """
-    metrics_dict can be multi-task (dict of dicts) or single dict
-    """
-    if isinstance(metrics_dict[list(metrics_dict.keys())[0]], dict):
-        # multi-task
-        for task, m in metrics_dict.items():
-            line = f"[{prefix}] {task} - Acc: {m['acc']:.4f}, F1: {m['f1']:.4f}, Kappa: {m['kappa']:.4f}"
-            print(line)
-            if use_wandb:
-                wandb.log({
-                    f"{prefix}/{task}_accuracy": m['acc'],
-                    f"{prefix}/{task}_f1_weighted": m['f1'],
-                    f"{prefix}/{task}_kappa": m['kappa'],
-                    "epoch": epoch
-                })
-        # aggregate across tasks
-        agg = {
-            'acc': np.mean([m['acc'] for m in metrics_dict.values()]),
-            'f1': np.mean([m['f1'] for m in metrics_dict.values()]),
-            'kappa': np.mean([m['kappa'] for m in metrics_dict.values()])
-        }
-    else:
-        # single task
-        m = metrics_dict
-        line = f"[{prefix}] Acc: {m['acc']:.4f}, F1: {m['f1']:.4f}, Kappa: {m['kappa']:.4f}"
-        print(line)
-        if use_wandb:
-            wandb.log({
-                f"{prefix}/accuracy": m['acc'],
-                f"{prefix}/f1_weighted": m['f1'],
-                f"{prefix}/kappa": m['kappa'],
-                "epoch": epoch
-            })
-        agg = m
-    return agg
-
-
-
-
-def save_best_models(model, metrics_dict, best_metrics, best_mean_metrics, checkpoint_dir):
-    """
-    metrics_dict: single or multi-task metrics
-    best_metrics: dict of best values
-    Updates best_metrics and saves checkpoint if new best
-    """
-    if isinstance(metrics_dict[list(metrics_dict.keys())[0]], dict):
-        # Multi-task
-        kl_metrics = metrics_dict.get("kl", {})
-        avg_metrics = {key: np.mean([m[key] for m in metrics_dict.values()]) for key in ['acc','f1','kappa']}
-
-        for key in ['acc','f1','kappa']:
-            # KL-best
-            kl_val = kl_metrics.get(key, -np.inf)
-            if kl_val > best_metrics.get(f"kl_{key}", -np.inf):
-                best_metrics[f"kl_{key}"] = kl_val
-                path = os.path.join(checkpoint_dir, f"best_model_kl_{key}.pth")
-                torch.save(model.state_dict(), path)
-                print(f"  Saved new best KL {key} model ({key}: {kl_val:.4f})")
-
-            # AVG-best
-            avg_val = avg_metrics[key]
-            if avg_val > best_mean_metrics.get(f"avg_{key}", -np.inf):
-                best_mean_metrics[f"avg_{key}"] = avg_val
-                path = os.path.join(checkpoint_dir, f"best_model_avg_{key}.pth")
-                torch.save(model.state_dict(), path)
-                print(f"  Saved new best AVG {key} model ({key}: {avg_val:.4f})")
-
-        print("Average metrics across all tasks:")
-    else:
-        for key in ['acc','f1','kappa']:
-            if metrics_dict[key] > best_metrics.get(key, -np.inf):
-                best_metrics[key] = metrics_dict[key]
-                path = os.path.join(checkpoint_dir, f"best_model_{key}.pth")
-                torch.save(model.state_dict(), path)
-                print(f"  Saved new best {key} model ({key}: {metrics_dict[key]:.4f})")
+    return avg_loss, all_labels, all_preds, all_probs
 
 def main(config):
     # ----------------- Setup ----------------- #
@@ -296,10 +213,6 @@ def main(config):
     val_ds = KneeMILDataset(config.H5_FILE, val_pids, transform=val_transform)
     test_ds = KneeMILDataset(config.H5_FILE, test_pids, transform=val_transform)
 
-    train_loader = DataLoader(train_ds, config.BATCH_SIZE, True, collate_fn=mil_collate_fn,
-                              num_workers=config.NUM_WORKERS, pin_memory=config.PIN_MEMORY)
-    val_loader = DataLoader(val_ds, config.BATCH_SIZE, False, collate_fn=mil_collate_fn,
-                            num_workers=config.NUM_WORKERS, pin_memory=config.PIN_MEMORY)
     test_loader = DataLoader(test_ds, config.BATCH_SIZE, False, collate_fn=mil_collate_fn,
                              num_workers=config.NUM_WORKERS, pin_memory=config.PIN_MEMORY)
 
@@ -307,90 +220,68 @@ def main(config):
     model = get_model(config)
     model_org = get_model_org(config)
 
-
+    model.load_state_dict(torch.load(
+            os.path.join(config.CHECKPOINT_DIR, f"best_model_{config.inference_target}_acc.pth"), 
+            map_location=config.DEVICE
+        ))
+    if model_org:
+        model_org.load_state_dict(torch.load(config.PRETRAINED_MODEL_PATH, map_location=config.DEVICE))
+        
     # ----------------- Loss & Optimizer ----------------- #
-    train_kl_grades = []
-    with h5py.File(config.H5_FILE, 'r') as hf:
-        for group_name in train_ds.sample_group_names:
-            train_kl_grades.append(hf[group_name]['kl_grade'][0])
-    class_counts = np.bincount(train_kl_grades, minlength=config.KL_NUM_CLASSES)
-    print(f"Class counts in training set: {class_counts}")
-
-    class_weights_tensor = compute_class_weights(config.classweight_type, class_counts, device=config.DEVICE)
-    print(f"Using class weights: {class_weights_tensor}")
-
+    class_weights_tensor = None
     criterion = get_criterion(config.lossfcn_type, class_weights_tensor, config.OARSI_TASKS)
-    optimizer = optim.Adam(model.parameters(), lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=10, factor=0.5)
+    optimizer = None
 
     # ----------------- Training Loop ----------------- #
-    best_metrics = {'kl_acc':0, 'kl_f1':0, 'kl_kappa':-1}  # for example
-    best_mean_metrics = {'avg_acc':0, 'avg_f1':0, 'avg_kappa':-1}
 
-    for epoch in range(config.NUM_EPOCHS):
-        torch.cuda.empty_cache()
-        epoch_num = epoch + 1
+    # Train
+    test_loss, test_labels, test_preds, test_probs = run_epoch(
+        test_loader, model, model_org, criterion, optimizer, config.DEVICE,
+        is_training=False, config=config,
+        desc=f"[Testing]"
+    )
+    print(f"\nTest Loss: {test_loss:.4f}")
+    results = [f"Test Loss: {test_loss:.4f}"]
+    test_metrics = compute_metrics(config.multitask_type, test_labels, test_preds)
 
-        # Train
-        train_loss, train_labels, train_preds, processed_train_samples = run_epoch(
-            train_loader, model, model_org, criterion, optimizer, config.DEVICE,
-            is_training=True, config=config,
-            desc=f"Epoch {epoch_num}/{config.NUM_EPOCHS} [Train]"
-        )
-        if processed_train_samples > 0:
-            train_metrics = compute_metrics(config.multitask_type, train_labels, train_preds)
-            log_metrics(train_metrics, "Train", epoch_num, use_wandb=config.WANDB)
+        
+    # for task in test_labels.keys():
+    task = config.inference_target
+    labels = test_labels[task]
+    preds = test_preds[task]
 
-        # Validate
-        val_loss, val_labels, val_preds, processed_val_samples = run_epoch(
-            val_loader, model, model_org, criterion, None, config.DEVICE,
-            is_training=False, config=config,
-            desc=f"Epoch {epoch_num}/{config.NUM_EPOCHS} [Val]"
-        )
-        scheduler.step(val_loss)
+    acc = test_metrics[task]["acc"]
+    f1 = test_metrics[task]["f1"]
+    kappa = test_metrics[task]["kappa"]
+    print(f"[Test] {task} - Acc: {acc:.4f}, F1: {f1:.4f}, Kappa: {kappa:.4f}")
+    results.append(f"[Test] {task} - Acc: {acc:.4f}, F1: {f1:.4f}, Kappa: {kappa:.4f}")
 
-        if processed_val_samples > 0:
-            val_metrics = compute_metrics(config.multitask_type, val_labels, val_preds)
-            log_metrics(val_metrics, "Val", epoch_num, use_wandb=config.WANDB)
+    num_classes = config.OARSI_TASKS[task]
+    target_names = [f"{task.upper()} {i}" for i in range(num_classes)]
 
-        # Save best
-        kl_metrics = val_metrics.get("kl", {})
-        for key in ['acc','f1','kappa']:
-            kl_val = kl_metrics.get(key, -np.inf)
-            if kl_val > best_metrics.get(f"kl_{key}", -np.inf):
-                best_metrics[f"kl_{key}"] = kl_val
-                path = os.path.join(config.CHECKPOINT_DIR, f"best_model_kl_{key}.pth")
-                torch.save(model.state_dict(), path)
-                print(f"  Saved new best KL {key} model ({key}: {kl_val:.4f})")
-            
-            if not config.multitask_type == "off":
-                avg_metrics = {key: np.mean([val_metrics[task][key] for task in val_metrics])}
-                # AVG-best
-                avg_val = avg_metrics[key]
-                if avg_val > best_mean_metrics.get(f"avg_{key}", -np.inf):
-                    best_mean_metrics[f"avg_{key}"] = avg_val
-                    path = os.path.join(config.CHECKPOINT_DIR, f"best_model_avg_{key}.pth")
-                    torch.save(model.state_dict(), path)
-                    print(f"  Saved new best AVG {key} model ({key}: {avg_val:.4f})")
+    report = classification_report(labels, preds, target_names=target_names, zero_division=0)
+    print(report)
+    results.append(f"\n[{task}]\n" + report)
+    
+    ConfusionMatrixDisplay.from_predictions(
+        labels, preds, normalize="true", cmap=plt.cm.Greens, values_format='.2f'
+    )
+    plt.savefig(os.path.join(config.CHECKPOINT_DIR, f"cm_{task}.eps"), format='eps')
+    plt.savefig(os.path.join(config.CHECKPOINT_DIR, f"cm_{task}.png"), format='png')
+    plt.close()
+    save_path = os.path.join(config.CHECKPOINT_DIR, "inference_result.txt")
+    with open(save_path, "w") as f:
+        for line in results:
+            f.write(line + "\n")
 
-            print("Average metrics across all tasks:")
-
-    print("Training finished.")
-    if config.WANDB:
-        wandb.finish()
+    print("Inference finished.")
 
 
 if __name__ == "__main__":
     from config import build_config
     config_dict = build_config()
-    
-    DEVICE = config_dict["DEVICE"]
-    config_dict["DEVICE"] = str(DEVICE)
-    config_path = os.path.join(config_dict["CHECKPOINT_DIR"], "config.json")
-    with open(config_path, "w") as f:
-        json.dump(config_dict, f, indent=4)
-    print(f"Config saved to: {config_path}")
-
-    config_dict["DEVICE"] = DEVICE
     cfg = Config(config_dict)
+    cfg.DEBUG_MODE = True
+    cfg.WANDB = False
     main(cfg)
+    
