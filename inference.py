@@ -9,7 +9,6 @@ from sklearn.metrics import classification_report, ConfusionMatrixDisplay
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
-import wandb
 from config import build_config
 from dataset import KneeMILDataset, mil_collate_fn
 from losses import coral_predict, coral_multitask_predict
@@ -22,7 +21,14 @@ from myutils import (
     create_transforms,
     prepare_data,
     get_model,
-    get_model_org
+    get_model_org,
+    process_CAM, 
+    visualize_attention_on_img,
+    normalize_attention_scores,
+    visualize_cam_comparisons,
+    patchFromPoint,
+    process_xray,
+    create_redsalpha,
 )
 
 class Config:
@@ -46,6 +52,9 @@ def run_epoch(loader, model, model_org, criterion, optimizer, device, is_trainin
         all_preds = {task: [] for task in config.OARSI_TASKS.keys()}
         all_labels = {task: [] for task in config.OARSI_TASKS.keys()}
         all_probs = {task: [] for task in config.OARSI_TASKS.keys()}
+        all_attentions = {task: [] for task in config.OARSI_TASKS.keys()}
+        all_patch_embeddings = {task: [] for task in config.OARSI_TASKS.keys()}
+        all_aggregated_features = {task: [] for task in config.OARSI_TASKS.keys()}
         
 
     # Setup attention tool if applicable
@@ -78,10 +87,9 @@ def run_epoch(loader, model, model_org, criterion, optimizer, device, is_trainin
         with torch.set_grad_enabled(is_training):
             # Forward pass
             if config.feedback_type == "off":
-                outputs, _, _, _ = model(moved_bags)
+                outputs, att_scores, patch_embeddings, aggregated_features = model(moved_bags)
             else:
-                outputs, _, _, _ = model(moved_bags, model_org, attention_tool)
-
+                outputs, att_scores, patch_embeddings, aggregated_features = model(moved_bags, model_org, attention_tool)
 
             # Target handling
             if config.multitask_type == "off":
@@ -137,45 +145,49 @@ def run_epoch(loader, model, model_org, criterion, optimizer, device, is_trainin
                 _, predicted = torch.max(outputs.data, 1)
             all_preds.extend(predicted.cpu().numpy())
             all_labels.extend(labels_batch.cpu().numpy())
-            all_probs.extend(probs.cpu().numpy())
+            # all_probs.extend(probs.cpu().numpy())
         else:
             if config.predict_criteria == "Coral_Multitask":
                 predicted, probs = coral_multitask_predict(outputs)
+                for task in config.OARSI_TASKS.keys():
+                    all_preds[task].extend(predicted[task][0].cpu().numpy())
+                    all_labels[task].extend(targets[task].cpu().numpy())
+                    all_attentions[task].extend(att_scores.detach().cpu().numpy())
+                    all_patch_embeddings[task].extend(patch_embeddings.detach().cpu().numpy())
+                    all_aggregated_features[task].extend(aggregated_features.detach().cpu().numpy())
 
-            for task in config.OARSI_TASKS.keys():
-                all_preds[task].extend(predicted[task][0].cpu().numpy())
-                all_labels[task].extend(targets[task].cpu().numpy())
-                all_probs[task].extend(probs[task][0].cpu().numpy())
+
+            elif config.predict_criteria == "Max_Multitask":
+                predicted = {}
+                for task, out in outputs.items():
+                    _, pred = torch.max(out.data, 1)
+                    predicted[task] = pred
+                for task in config.OARSI_TASKS.keys():
+                    all_preds[task].extend(predicted[task].cpu().numpy())
+                    all_labels[task].extend(targets[task].cpu().numpy())
+                    all_attentions[task].extend(att_scores.detach().cpu().numpy())
+                    all_patch_embeddings[task].extend(patch_embeddings.detach().cpu().numpy())
+                    all_aggregated_features[task].extend(aggregated_features.detach().cpu().numpy())
+
+
+                # all_probs[task].extend(probs[task][0].cpu().numpy())
 
         progress_bar.set_postfix(loss=loss.item())
 
     avg_loss = total_loss / num_processed_samples if num_processed_samples > 0 else 0
-    return avg_loss, all_labels, all_preds, all_probs
+    return avg_loss, all_labels, all_preds, all_probs, all_attentions, all_patch_embeddings, all_aggregated_features
 
 def main(config):
     # ----------------- Setup ----------------- #
     # Copy source files for reproducibility
-    files_to_copy = ["train.py", "model.py", "dataset.py", "data_augmentation.py", "losses.py", "utils.py", "config.py"]
-    if not config.DEBUG_MODE:
-        for file in files_to_copy:
-            if os.path.exists(file):
-                shutil.copy(file, config.CHECKPOINT_DIR)
-                print(f"Copied {file} to {config.CHECKPOINT_DIR}")
-            else:
-                print(f"WARNING: {file} not found and was not copied.")
+    files_to_copy = ["inference.py"]
+    for file in files_to_copy:
+        if os.path.exists(file):
+            shutil.copy(file, config.CHECKPOINT_DIR)
+            print(f"Copied {file} to {config.CHECKPOINT_DIR}")
+        else:
+            print(f"WARNING: {file} not found and was not copied.")
 
-        # Initialize wandb
-        wandb.init(
-            project="Knee_OA_MIL",
-            name=config.run_name,
-            config=vars(config),
-            tags=[
-                f"lr{config.LEARNING_RATE:.0e}",
-                f"b{config.BATCH_SIZE}",
-                f"s{config.SEED}",
-                f"e{config.NUM_EPOCHS}"
-            ],
-        )
     # ----------------- Data ----------------- #
     groups, grades = prepare_data(config.H5_FILE)
     print(f"Total valid samples: {len(groups)}")
@@ -212,18 +224,116 @@ def main(config):
     train_ds = KneeMILDataset(config.H5_FILE, train_pids, transform=train_transform)
     val_ds = KneeMILDataset(config.H5_FILE, val_pids, transform=val_transform)
     test_ds = KneeMILDataset(config.H5_FILE, test_pids, transform=val_transform)
+    
+    # from collections import Counter
+    # oarsi_key= {
+    #             "jsnm": 4,  # 0–3 ordinal
+    #             "jsnl": 4,  # 0–3 ordinal
+    #             "osfm": 4,  # 0–3 ordinal
+    #             "ostm": 4,  # 0–3 ordinal
+    #             "ostl": 4,  # 0–3 ordinal
+    #             "osfl": 4,  # 0–3 ordinal
+    #         }
+    # def count_dataset(dataset):
+    #     kl_counts = Counter()
+    #     oarsi_counts = {task: Counter() for task in oarsi_key.keys()}
 
+    #     for i in range(len(dataset)):
+    #         _, kl, _, aux = dataset[i]
+
+    #         kl_val = int(kl.item())
+    #         kl_counts[kl_val] += 1
+
+    #         aux = aux.view(-1)
+
+    #         # loop only over available features
+    #         for idx, task in enumerate(list(oarsi_key.keys())[:aux.size(0)]):
+    #             val = int(aux[idx].item())
+    #             oarsi_counts[task][val] += 1
+
+    #     return kl_counts, oarsi_counts
+    # train_kl, train_oarsi = count_dataset(train_ds)
+    # val_kl, val_oarsi     = count_dataset(val_ds)
+    # test_kl, test_oarsi   = count_dataset(test_ds)
+
+    # print("Train KL:", train_kl)
+    # print("Train OARSI:", train_oarsi)
+    # print("Val KL:", val_kl)
+    # print("Val OARSI:", val_oarsi)
+    # print("Test KL:", test_kl)
+    # print("Test OARSI:", test_oarsi)
+    # # Convert counts to long-format rows
+    # rows = []
+    # def counters_to_rows(dataset_name, kl_counts, oarsi_counts):
+    #     for grade, count in kl_counts.items():
+    #         rows.append({
+    #             "Dataset": dataset_name,
+    #             "Task": "KL",
+    #             "Class": grade,
+    #             "Count": count
+    #         })
+    #     for task, cnt in oarsi_counts.items():
+    #         for score, count in cnt.items():
+    #             rows.append({
+    #                 "Dataset": dataset_name,
+    #                 "Task": task,
+    #                 "Class": score,
+    #                 "Count": count
+    #             })
+
+    # counters_to_rows("Train", train_kl, train_oarsi)
+    # counters_to_rows("Val", val_kl, val_oarsi)
+    # counters_to_rows("Test", test_kl, test_oarsi)
+    # import pandas as pd
+    # # Create long-format DataFrame
+    # df_all = pd.DataFrame(rows)
+
+    # # Create pivot summary
+    # pivot_wide = df_all.pivot_table(
+    #     index=["Dataset", "Class"],   # rows: Dataset + Grade/Class
+    #     columns="Task",               # columns: Task
+    #     values="Count",               # fill with Count
+    #     fill_value=0                  # replace missing with 0
+    # ).reset_index()
+
+    # # Reorder columns
+    # cols = ["Dataset", "Class", "KL", "jsnm", "jsnl", "osfm", "ostm", "ostl", "osfl"]
+    # pivot_wide = pivot_wide[cols]
+
+    # # Save to CSV
+    # pivot_wide.to_csv("dataset_summary.csv", index=False)
+    
     test_loader = DataLoader(test_ds, config.BATCH_SIZE, False, collate_fn=mil_collate_fn,
                              num_workers=config.NUM_WORKERS, pin_memory=config.PIN_MEMORY)
+    # kl4_pids = []
+    # for idx, pid in enumerate(test_pids):
+    #     _, label, _, _ = test_ds[idx]   # returns (patch_bag, label)
+        
+    #     # case 1: if label is just an int
+    #     if isinstance(label, int) or isinstance(label, torch.Tensor):
+    #         if int(label) == 4:
+    #             kl4_pids.append(pid)
+        
+    #     # case 2: if label is a dict with key "kl"
+    #     elif isinstance(label, dict) and "kl" in label:
+    #         if int(label["kl"]) == 4:
+    #             kl4_pids.append(pid)
+    
+    # print("Patients with KL=4:", kl4_pids)
+
 
     # ----------------- Model ----------------- #
     model = get_model(config)
     model_org = get_model_org(config)
 
     model.load_state_dict(torch.load(
-            os.path.join(config.CHECKPOINT_DIR, f"best_model_{config.inference_target}_acc.pth"), 
+            os.path.join(config.CHECKPOINT_DIR, f"best_model_{config.inference_target}_kappa.pth"), 
             map_location=config.DEVICE
         ))
+    # model.load_state_dict(torch.load(
+    #         os.path.join(config.CHECKPOINT_DIR, f"best_model_avg_kappa.pth"), 
+    #         map_location=config.DEVICE
+    #     ))
     if model_org:
         model_org.load_state_dict(torch.load(config.PRETRAINED_MODEL_PATH, map_location=config.DEVICE))
         
@@ -233,9 +343,7 @@ def main(config):
     optimizer = None
 
     # ----------------- Training Loop ----------------- #
-
-    # Train
-    test_loss, test_labels, test_preds, test_probs = run_epoch(
+    test_loss, test_labels, test_preds, test_probs, all_attentions, all_patch_embeddings, all_aggregated_features = run_epoch(
         test_loader, model, model_org, criterion, optimizer, config.DEVICE,
         is_training=False, config=config,
         desc=f"[Testing]"
@@ -244,38 +352,217 @@ def main(config):
     results = [f"Test Loss: {test_loss:.4f}"]
     test_metrics = compute_metrics(config.multitask_type, test_labels, test_preds)
 
-        
-    # for task in test_labels.keys():
-    task = config.inference_target
-    labels = test_labels[task]
-    preds = test_preds[task]
-
-    acc = test_metrics[task]["acc"]
-    f1 = test_metrics[task]["f1"]
-    kappa = test_metrics[task]["kappa"]
-    print(f"[Test] {task} - Acc: {acc:.4f}, F1: {f1:.4f}, Kappa: {kappa:.4f}")
-    results.append(f"[Test] {task} - Acc: {acc:.4f}, F1: {f1:.4f}, Kappa: {kappa:.4f}")
-
-    num_classes = config.OARSI_TASKS[task]
-    target_names = [f"{task.upper()} {i}" for i in range(num_classes)]
-
-    report = classification_report(labels, preds, target_names=target_names, zero_division=0)
-    print(report)
-    results.append(f"\n[{task}]\n" + report)
-    
-    ConfusionMatrixDisplay.from_predictions(
-        labels, preds, normalize="true", cmap=plt.cm.Greens, values_format='.2f'
+    # save all test data as np
+    np.savez(
+        os.path.join(config.CHECKPOINT_DIR, "test_pred.npz"),
+        id=test_pids,
+        prob=test_probs,
+        pred=test_preds,
+        true_kl=test_labels if config.multitask_type == "off" else test_labels["kl"]
     )
-    plt.savefig(os.path.join(config.CHECKPOINT_DIR, f"cm_{task}.eps"), format='eps')
-    plt.savefig(os.path.join(config.CHECKPOINT_DIR, f"cm_{task}.png"), format='png')
-    plt.close()
-    save_path = os.path.join(config.CHECKPOINT_DIR, "inference_result.txt")
-    with open(save_path, "w") as f:
-        for line in results:
-            f.write(line + "\n")
+    
+    if config.multitask_type == "off":
+        task = "kl"
+        num_classes = 5
+        labels = test_labels
+        preds = test_preds
+        acc = test_metrics[task]["acc"]
+        f1 = test_metrics[task]["f1"]
+        kappa = test_metrics[task]["kappa"]
+        print(f"[Test] Acc: {acc:.4f}, F1: {f1:.4f}, Kappa: {kappa:.4f}")
+        results.append(f"[Test] Acc: {acc:.4f}, F1: {f1:.4f}, Kappa: {kappa:.4f}")
+        target_names = [f"{task.upper()} {i}" for i in range(num_classes)]
+
+        report = classification_report(labels, preds, target_names=target_names, zero_division=0)
+        print(report)
+        results.append(f"\n[{task}]\n" + report)
+        
+        ConfusionMatrixDisplay.from_predictions(
+            labels, preds, normalize="true", cmap=plt.cm.Greens, values_format='.2f'
+        )
+        plt.savefig(os.path.join(config.CHECKPOINT_DIR, f"cm_{task}_kappa.eps"), format='eps')
+        plt.savefig(os.path.join(config.CHECKPOINT_DIR, f"cm_{task}_kappa.png"), format='png')
+        plt.close()
+        save_path = os.path.join(config.CHECKPOINT_DIR, "inference_result.txt")
+        with open(save_path, "w") as f:
+            for line in results:
+                f.write(line + "\n")
+    else:
+        for task in test_labels.keys():
+            labels = test_labels[task]
+            preds = test_preds[task]
+
+            acc = test_metrics[task]["acc"]
+            f1 = test_metrics[task]["f1"]
+            kappa = test_metrics[task]["kappa"]
+            print(f"[Test] {task} - Acc: {acc:.4f}, F1: {f1:.4f}, Kappa: {kappa:.4f}")
+            results.append(f"[Test] {task} - Acc: {acc:.4f}, F1: {f1:.4f}, Kappa: {kappa:.4f}")
+
+            num_classes = config.OARSI_TASKS[task]
+            target_names = [f"{task.upper()} {i}" for i in range(num_classes)]
+
+            report = classification_report(labels, preds, target_names=target_names, zero_division=0)
+            print(report)
+            results.append(f"\n[{task}]\n" + report)
+            
+
+            ConfusionMatrixDisplay.from_predictions(
+                labels, preds, normalize="true", cmap=plt.cm.Greens, values_format='.2f'
+            )
+            # Add title
+            plt.title(f"{task.upper()} - Normalized Confusion Matrix")
+            plt.savefig(os.path.join(config.CHECKPOINT_DIR, f"cm_{task}.eps"), format='eps')
+            plt.savefig(os.path.join(config.CHECKPOINT_DIR, f"cm_{task}.png"), format='png')
+            plt.close()
+            save_path = os.path.join(config.CHECKPOINT_DIR, "inference_result.txt")
+            with open(save_path, "w") as f:
+                for line in results:
+                    f.write(line + "\n")
+
+            np.savez(
+                os.path.join(config.CHECKPOINT_DIR, f"test_pred_{task}.npz"),
+                id=test_pids,
+                prob=test_probs[task],
+                pred=test_preds[task],
+                true=test_labels[task],
+                all_attentions=all_attentions[task],
+                all_patch_embeddings=all_patch_embeddings[task],
+                all_aggregated_features=all_aggregated_features[task],
+            )
 
     print("Inference finished.")
+    
+    # creat the histogram of attention scores based on patches label
+    # plt.rcParams.update({'font.size': 14})
+    # plt.figure(figsize=(8,6))
+    # all_attentions_array = np.array(all_attentions['kl'])  # Convert list to array
+    # plt.hist(all_attentions_array, bins=50, color='blue', alpha=0.7)
+    # plt.title('Histogram of Attention Scores (KL Task)')
+    # plt.xlabel('Attention Score')
+    # plt.ylabel('Frequency')
+    # plt.grid(axis='y', alpha=0.75)
+    # plt.savefig(os.path.join(config.CHECKPOINT_DIR, "attention_scores_histogram_kl.png"))
+    # plt.close()
 
+
+
+    # ================== Visualization for a single example ==============================
+    ######################################################################################
+
+    # kl4_pids = []
+    # for idx, pid in enumerate(test_pids):
+    #     _, label, _, _ = test_ds[idx]   # returns (patch_bag, label)
+        
+    #     # case 1: if label is just an int
+    #     if isinstance(label, int) or isinstance(label, torch.Tensor):
+    #         if int(label) == 4:
+    #             kl4_pids.append(pid)
+        
+    #     # case 2: if label is a dict with key "kl"
+    #     elif isinstance(label, dict) and "kl" in label:
+    #         if int(label["kl"]) == 4:
+    #             kl4_pids.append(pid)
+    
+    # print("Patients with KL=4:", kl4_pids)
+    # Patients with KL=4: ['9975485_R', '9932578_R', '9723575_L', '9653465_L', '9761463_R', '9924274_L', '9292234_L', '9215922_R', '9160801_R', '9225592_L', '9458416_L', '9478504_R', '9445318_L', '9604541_R', '9049007_L', '9635581_R', '9919646_R', '9368395_R', '9813958_R', '9572948_R', '9581915_L', '9757953_L', '9659956_L', '9690658_R', '9638123_R', '9317124_L', '9055836_R', '9039627_L', '9363397_L', '9992318_L', '9511862_R', '9095103_L', '9669124_R', '9613488_L', '9910391_R', '9693806_R', '9230284_L', '9263504_R', '9413071_R', '9049507_L', '9218916_L', '9458093_L', '9828555_L', '9721540_L', '9781749_R', '9256759_R', '9727543_L', '9495873_R', '9512864_L', '9858216_R', '9053047_L', '9742871_R', '9448133_L', '9772692_L', '9425996_L', '9235666_R', '9896743_L', '9645683_L', '9627172_R']
+    target_id = "9932578"
+    # target_id = "9215922"
+    target_side = "R"
+    index = np.where(np.array(test_pids)==target_id + "_" + target_side)[0].item()
+    target_layer = [model.patch_feature_extractor.conv_block3[0]]
+    patches_test, kl_label, id, oarsi_label = test_ds.__getitem__(index)
+    
+    patch_bag_tensor = torch.stack(patches_test).to(config.DEVICE)  # shape: [41, 1, 16, 16]
+    # print(test_pids[index], kl_label, id, oarsi_label)
+    model.eval()
+    attention_tool = None
+    if config.feedback_type == "off":
+        logits, att_scores, patch_embeddings, aggregated_features = model([patch_bag_tensor])
+    else:
+        logits, att_scores, patch_embeddings, aggregated_features = model([patch_bag_tensor], model_org, attention_tool)
+
+    print(f"patch_bag_tensor shape: {patch_bag_tensor.shape}")  # shape you pass IN
+    print(f"logits : {logits}")                      # shape OUT
+    print(f"att_scores shape: {att_scores.shape}")              # if relevant
+
+    # Argmax across classes
+    target_classes = logits['kl'].argmax(dim=1)
+    print(f"target_classes shape: {target_classes.shape}")      # should be [batch_size]
+
+    # If you want just the first class for score:
+    target_class = target_classes[0].item()
+    print(f"target_class: {target_class}")
+
+    # Use the first logit row (batch item 0) and its predicted class
+    score = logits['kl'][0, target_class]
+    print(f"score shape: {score.shape}")  # should be scalar, so shape = []
+
+    model.zero_grad()
+    score.backward(retain_graph=True)
+    grayscale_cam_dict, PATCH_POINT_INDICES = process_CAM(model, target_layer, target_class, patch_bag_tensor, patches_test, config.CHECKPOINT_DIR)
+
+    # cam_data_sources, PATCH_POINT_INDICES
+    ########################################
+    # 這邊應該是給蒐集好所有的data的處理
+    data = np.load("./original_data/V00/id_shapes_LR_V00.npz")
+    patient_ids = data["id"]
+    shapes_L_2d = data["shapes_L"]
+    shapes_R_2d = data["shapes_R"]
+    kl_grades_L_np = data["KL_L"]
+    kl_grades_R_np = data["KL_R"]
+    aux_features_L = data["aux_L_np"]
+    aux_features_R = data["aux_R_np"]
+    index_test = index
+    pid_side = test_pids[index_test]
+    pid, side = str.split(pid_side, "_")
+    index_all = np.where(np.array(patient_ids) == pid)[0].item()
+    print(f"{test_pids[index_test]}, {patient_ids[index_all]}, L: {kl_grades_L_np[index_all]}, R: {kl_grades_R_np[index_all]}")
+    print("Index test:", index_test, "Index all:", index_all) # index_test: the index of the test set; index_all: the index of the whole dataset
+    # print("Prediction:")
+    # print({task: test_preds[task][index_test] for task in test_preds}) # all prediction data
+    # print(" ".join(f"{x:.5f}" for x in test_preds[index_test]))
+    # print(index_test)
+    # if np.argmax(test_preds[index_test]) == test_preds['kl'][index_test]:
+    #     print("Correct!")
+    # else:
+    #     print("Wrong!")
+
+    # att_scores = att_scores[index_test]
+    att_scores = normalize_attention_scores(att_scores.detach().cpu().numpy()) # 41, 1
+    print(att_scores.shape)
+
+    visualize_attention_on_img(
+        save_path=config.CHECKPOINT_DIR,
+        file_path=rf"./original_data/V00/Bilateral_PA_Fixed_Flexion_Knee/{patient_ids[index_all]}.dcm",
+        patient_id=patient_ids[index_all],
+        index_all=index_all,
+        shapes_L_2d=shapes_L_2d,
+        shapes_R_2d=shapes_R_2d,
+        att_scores=att_scores.squeeze(),  # convert to 1D array
+        side=target_side,  # or 'R'
+        patchFromPoint=patchFromPoint,
+        process_xray=process_xray
+    )
+    reds_alpha = create_redsalpha()
+
+    visualize_cam_comparisons(
+        save_path=config.CHECKPOINT_DIR,
+        patient_id=patient_ids[index_all],
+        index_all=index_all,
+        index_test=index_test,
+        side=target_side,  # or "R"
+        test_labels=test_labels,
+        test_preds=test_preds,
+        att_scores=att_scores,
+        grayscale_cam_dict=grayscale_cam_dict,
+        process_xray_func=process_xray,
+        patch_from_point_func=patchFromPoint,
+        shapes_L_2d=shapes_L_2d,
+        shapes_R_2d=shapes_R_2d,
+        file_path_template=f"./original_data/V00/Bilateral_PA_Fixed_Flexion_Knee/{patient_ids[index_all]}.dcm",
+        patch_point_indices=PATCH_POINT_INDICES,
+        cmap_obj=reds_alpha,
+    )
 
 if __name__ == "__main__":
     from config import build_config
@@ -284,4 +571,6 @@ if __name__ == "__main__":
     cfg.DEBUG_MODE = True
     cfg.WANDB = False
     main(cfg)
+
+    
     
