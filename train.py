@@ -278,6 +278,7 @@ def save_best_models(model, metrics_dict, best_metrics, best_mean_metrics, check
 
 
 def main(config):
+    split_seed = 42
     torch.manual_seed(config.SEED)
     torch.cuda.manual_seed(config.SEED)
     # ----------------- Setup ----------------- #
@@ -309,10 +310,10 @@ def main(config):
 
     # Train/val/test split
     train_val, test, train_val_grades, _ = train_test_split(
-        np.array(groups), np.array(grades), test_size=0.2, stratify=grades, random_state=config.SEED
+        np.array(groups), np.array(grades), test_size=0.2, stratify=grades, random_state=split_seed
     )
     train, val, _, _ = train_test_split(
-        train_val, train_val_grades, test_size=0.25, stratify=train_val_grades, random_state=config.SEED
+        train_val, train_val_grades, test_size=0.25, stratify=train_val_grades, random_state=split_seed
     )
 
     train_pids, val_pids, test_pids = train.tolist(), val.tolist(), test.tolist()

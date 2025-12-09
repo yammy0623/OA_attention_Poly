@@ -784,7 +784,31 @@ python train.py \
   --feedback_cam off \
   --note final_reproduce_1_again
 
+python inference.py \
+  --current_ckpt model_checkpoints_20251109_032115_epoch200_MIL_MultiTask_imedslab_LCEoM_MA_C0_Fo_lr1e-04_b16 \
+  --seed 42 \
+  --model_type MIL_MultiTask_imedslab \
+  --lossfcn_type CrossEntropy_MultiTask \
+  --predict_criteria Max_Multitask \
+  --classweight_type all_metrics_inv \
+  --multitask_type all \
+  --feedback_type off \
+  --feedback_cam off \
+  --note final_reproduce_1_again
+
 python train.py \
+  --seed 0 \
+  --model_type MIL_MultiTask_imedslab \
+  --lossfcn_type CrossEntropy_MultiTask \
+  --predict_criteria Max_Multitask \
+  --classweight_type all_metrics_inv \
+  --multitask_type all \
+  --feedback_type off \
+  --feedback_cam off \
+  --note final_reproduce_2_again
+
+python inference.py \
+  --current_ckpt model_checkpoints_20251109_032130_epoch200_MIL_MultiTask_imedslab_LCEoM_MA_C0_Fo_lr1e-04_b16 \
   --seed 0 \
   --model_type MIL_MultiTask_imedslab \
   --lossfcn_type CrossEntropy_MultiTask \
@@ -806,7 +830,32 @@ python train.py \
   --feedback_cam off \
   --note final_reproduce_3_again
 
+python inference.py \
+  --current_ckpt model_checkpoints_20251109_032253_epoch200_MIL_MultiTask_imedslab_LCEoM_MA_C0_Fo_lr1e-04_b16 \
+  --seed 2024 \
+  --model_type MIL_MultiTask_imedslab \
+  --lossfcn_type CrossEntropy_MultiTask \
+  --predict_criteria Max_Multitask \
+  --classweight_type all_metrics_inv \
+  --multitask_type all \
+  --feedback_type off \
+  --feedback_cam off \
+  --note final_reproduce_3_again
+
+
 python train.py \
+  --seed 2022 \
+  --model_type MIL_MultiTask_imedslab \
+  --lossfcn_type CrossEntropy_MultiTask \
+  --predict_criteria Max_Multitask \
+  --classweight_type all_metrics_inv \
+  --multitask_type all \
+  --feedback_type off \
+  --feedback_cam off \
+  --note final_reproduce_4_again
+
+python inference.py \
+  --current_ckpt model_checkpoints_20251109_032310_epoch200_MIL_MultiTask_imedslab_LCEoM_MA_C0_Fo_lr1e-04_b16 \
   --seed 2022 \
   --model_type MIL_MultiTask_imedslab \
   --lossfcn_type CrossEntropy_MultiTask \
@@ -827,3 +876,51 @@ python train.py \
   --feedback_type off \
   --feedback_cam off \
   --note final_reproduce_5_again
+
+python inference.py \
+  --current_ckpt model_checkpoints_20251109_032342_epoch200_MIL_MultiTask_imedslab_LCEoM_MA_C0_Fo_lr1e-04_b16 \
+  --seed 2025 \
+  --model_type MIL_MultiTask_imedslab \
+  --lossfcn_type CrossEntropy_MultiTask \
+  --predict_criteria Max_Multitask \
+  --classweight_type all_metrics_inv \
+  --multitask_type all \
+  --feedback_type off \
+  --feedback_cam off \
+  --note final_reproduce_5_again
+
+
+python train_k_fold.py \
+  --debug \
+  --seed 2025 \
+  --model_type MIL_MultiTask_imedslab \
+  --lossfcn_type CrossEntropy_MultiTask \
+  --predict_criteria Max_Multitask \
+  --classweight_type all_metrics_inv \
+  --multitask_type all \
+  --feedback_type off \
+  --feedback_cam off \
+  --note k_fold
+
+python train_k_fold.py \
+  --seed 42 \
+  --model_type MIL_MultiTask_imedslab \
+  --lossfcn_type CrossEntropy_MultiTask \
+  --predict_criteria Max_Multitask \
+  --classweight_type all_metrics_inv \
+  --multitask_type all \
+  --feedback_type off \
+  --feedback_cam off \
+  --note k_fold_42
+
+python inference_k_fold.py \
+  --current_ckpt model_checkpoints_20251119_025306_epoch200_MIL_MultiTask_imedslab_LCEoM_MA_C0_Fo_lr1e-04_b16 \
+  --seed 42 \
+  --model_type MIL_MultiTask_imedslab \
+  --lossfcn_type CrossEntropy_MultiTask \
+  --predict_criteria Max_Multitask \
+  --classweight_type all_metrics_inv \
+  --multitask_type all \
+  --feedback_type off \
+  --feedback_cam off \
+  --note k_fold_42

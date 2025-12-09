@@ -12,6 +12,7 @@ DATA_HALF = False
 
 # Dataset / Checkpoints
 DEFAULT_H5_FILE = "knee_patches_patient_grouped_16_100_all_feature.h5"
+# DEFAULT_H5_FILE = "./original_data/V00/V00_knee_patches_patient_grouped_16_128_all_feature_roundjsn.h5"
 DEFAULT_PRE_CKPT_DIR = "model_checkpoints_tnc_final"
 DEFAULT_PRETRAINED_MODEL = os.path.join(DEFAULT_PRE_CKPT_DIR, "best_model_val_kappa.pth")
 
@@ -33,7 +34,7 @@ LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
 BATCH_SIZE = 16
 NUM_EPOCHS = 200
-SEED = 42
+# SEED = 42
 DEFAULT_MAX_PIXEL_VALUE = 65535.0
 
 # Device setup
@@ -49,10 +50,12 @@ def get_args():
     parser.add_argument("--current_ckpt", type=str, default=None)
     parser.add_argument("--use_baseline", action="store_true", help="Use baseline MIL model")
     parser.add_argument("--debug", action="store_true", help="Debug mode")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument(
             "--model_type",
             type=str,
-            choices=["MIL", "MTLOrdinal", "MTLOrdinal_MultiTask", "MTLCoral_MultiTask"],
+            choices=["MIL", "MIL_MultiTask", "MIL_MultiTask_SharedHead", "MIL_wGP_MultiTask", "MILOrdinal",
+                    "MILOrdinal_MultiTask", "MILCoral_MultiTask", "MIL_MultiTask_imedslab", "MILOrdinal_MultiTask_imedslab"],
             default="MIL",
             help= "Choose the MIL model type"
         )
@@ -61,15 +64,16 @@ def get_args():
     parser.add_argument(
         "--lossfcn_type",
         type=str,
-        choices=["CrossEntropy", "CoralLoss_MultiTask", "CoralLossWeighted", "CoralFocalLoss_MultiTask", "CoralLossEffective"],
-        default="OrdinalMSE",
+        choices=["CrossEntropy","CrossEntropy_MultiTask", "CoralLoss_MultiTask", "CoralLossWeighted", "CoralFocalLoss_MultiTask", 
+                 "CoralLossEffective", "CoralFocalLoss_MultiTask_MetricsBalanced", "BCEWithLogitsLoss_MultiTask"],
+        default="CrossEntropy",
         help="Choose the loss function"
     )
 
     parser.add_argument(
         "--predict_criteria",
         type=str, 
-        choices=["Max", "Coral_Multitask", "Coral"],
+        choices=["Max", "Max_Multitask", "Coral_Multitask", "Coral", "ordinal"],
         default="Max"
     )
 
@@ -85,7 +89,7 @@ def get_args():
     parser.add_argument(
         "--classweight_type",
         type=str,
-        choices = ["inv", "effective"], # effective has positive and negative
+        choices = ["inv", "effective", "balanace_sampling", "all_metrics_inv"], # effective has positive and negative
         default="inv"
 
     )
@@ -121,6 +125,11 @@ def get_args():
         default="kl"
     )
     parser.add_argument(
+        "--balance_sampling",
+        action="store_true", 
+        help="Use balance sampling"
+    )
+    parser.add_argument(
         "--note",
         type=str,
         default="",
@@ -148,8 +157,9 @@ def build_config():
 
     # timestamp + run_name
 
-    loss_map = {"CrossEntropy": "CE", "CoralLoss_MultiTask": "CLoM", "CoralLossWeighted": "CLoW", 
-                "CoralFocalLoss_MultiTask": "CFLoM", "CoralLossEffective": "CLoE"}
+    loss_map = {"CrossEntropy": "CE", "CrossEntropy_MultiTask": "CEoM", "CoralLoss_MultiTask": "CLoM", "CoralLossWeighted": "CLoW", 
+                "CoralFocalLoss_MultiTask": "CFLoM", "CoralLossEffective": "CLoE", "CoralFocalLoss_MultiTask_MetricsBalanced": "CFLMB",
+                "OrdinalMSE": "MSE", "BCEWithLogitsLoss_MultiTask": "BCEWL"}
     mtask_map = {"off": "0", "kl_jsn": "KJ", "all": "A"}
     cam_map = {"off": "0", "GradCAM": "GC", "GradCAMPlusPlus": "GPP", 
             "ScoreCAM": "SC", "AblationCAM": "AC", "LayerCAM": "LC"}
@@ -187,6 +197,8 @@ def build_config():
         OARSI_TASKS = {
             "kl": 5, "jsnm": 4, "jsnl": 4
         }
+    else:
+        OARSI_TASKS = {"kl": 5}
 
     config = {
         # experiment setup
@@ -208,7 +220,7 @@ def build_config():
         "WEIGHT_DECAY": WEIGHT_DECAY,
         "BATCH_SIZE": BATCH_SIZE,
         "NUM_EPOCHS": NUM_EPOCHS,
-        "SEED": SEED,
+        "SEED": args.seed,
         "DEFAULT_MAX_PIXEL_VALUE": DEFAULT_MAX_PIXEL_VALUE,
         "NUM_FEATURES": num_features,
         "DATA_PART": data_part,
@@ -216,10 +228,9 @@ def build_config():
         # tasks
         "KL_NUM_CLASSES": KL_NUM_CLASSES,
         "OARSI_TASKS": OARSI_TASKS,
-        "NUM_FEATURES": NUM_FEATURES,
 
         # Ablation study
-        "model_type": args.model_type, # "MIL", "MTLOrdinal", "MTLOrdinal_MultiTask"
+        "model_type": args.model_type, # "MIL", "MILOrdinal", "MILOrdinal_MultiTask"
         "lossfcn_type": args.lossfcn_type, # "CoralLossWeighted", "OrdinalAndFocal", "OrdinalMSE", 
         "multitask_type": args.multitask_type, # "off", "kl", "kl_jsn", "all"
         "feedback_type": args.feedback_type, # "off", "on"
@@ -227,6 +238,7 @@ def build_config():
         "classweight_type": args.classweight_type, 
         "predict_criteria": args.predict_criteria,
         "inference_target": args.inference_target,
+        "balance_sampling": args.balance_sampling,
 
         # device
         "DEVICE": DEVICE,
